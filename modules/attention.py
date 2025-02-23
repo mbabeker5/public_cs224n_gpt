@@ -34,7 +34,41 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
 
     ### YOUR CODE HERE
-    raise NotImplementedError
+    # key, query, value shapes: [bs, num_heads, seq_len, head_size]
+    # attention_mask shape: [bs, 1, 1, seq_len]
+    
+    # Calculate attention scores
+    # (bs, num_heads, seq_len, head_size) @ (bs, num_heads, head_size, seq_len)
+    # -> (bs, num_heads, seq_len, seq_len)
+    attention_scores = torch.matmul(query, key.transpose(-1, -2))
+    
+    # Scale attention scores
+    attention_scores = attention_scores / (self.attention_head_size ** 0.5)
+    
+    # Add attention mask
+    attention_scores = attention_scores + attention_mask
+    
+    # Create causal mask to ensure tokens can only attend to previous tokens
+    seq_length = query.size(-2)
+    causal_mask = torch.triu(torch.ones(seq_length, seq_length), diagonal=1).bool()
+    causal_mask = causal_mask.to(attention_scores.device)
+    attention_scores.masked_fill_(causal_mask, float('-inf'))
+    
+    # Apply softmax to get attention probabilities
+    attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
+    
+    # Apply dropout
+    attention_probs = self.dropout(attention_probs)
+    
+    # Calculate the attention output
+    # (bs, num_heads, seq_len, seq_len) @ (bs, num_heads, seq_len, head_size)
+    # -> (bs, num_heads, seq_len, head_size)
+    attention_output = torch.matmul(attention_probs, value)
+    
+    # Reshape output back to [bs, seq_len, hidden_size]
+    attention_output = rearrange(attention_output, 'b h t d -> b t (h d)')
+    
+    return attention_output
 
 
   def forward(self, hidden_states, attention_mask):

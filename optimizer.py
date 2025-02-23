@@ -61,7 +61,40 @@ class AdamW(Optimizer):
                 ###
                 ###       Refer to the default project handout for more details.
                 ### YOUR CODE HERE
-                raise NotImplementedError
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    # Exponential moving average of gradient values
+                    state["exp_avg"] = torch.zeros_like(p.data)
+                    # Exponential moving average of squared gradient values
+                    state["exp_avg_sq"] = torch.zeros_like(p.data)
+
+                # Get parameters for update
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = group["betas"]
+                state["step"] += 1
+
+                # Update first and second moments of gradients
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # Bias correction
+                if group["correct_bias"]:
+                    bias_correction1 = 1 - beta1 ** state["step"]
+                    bias_correction2 = 1 - beta2 ** state["step"]
+                    step_size = alpha * math.sqrt(bias_correction2) / bias_correction1
+                else:
+                    step_size = alpha
+
+                # Compute denominator
+                denom = exp_avg_sq.sqrt().add_(group["eps"])
+
+                # Update parameters
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+                # Weight decay after the main gradient-based updates
+                if group["weight_decay"] > 0:
+                    p.data.add_(p.data, alpha=-group["weight_decay"] * group["lr"])
 
 
         return loss
