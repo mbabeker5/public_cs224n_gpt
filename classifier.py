@@ -55,17 +55,30 @@ class GPT2SentimentClassifier(torch.nn.Module):
 
     ### TODO: Create any instance variables you need to classify the sentiment of BERT embeddings.
     ### YOUR CODE HERE
-    raise NotImplementedError
-
+    self.classifier = torch.nn.Sequential(
+        torch.nn.Linear(config.hidden_size, config.hidden_size),
+        torch.nn.Tanh(),
+        torch.nn.Dropout(config.hidden_dropout_prob),
+        torch.nn.Linear(config.hidden_size, self.num_labels)
+    )
 
   def forward(self, input_ids, attention_mask):
     '''Takes a batch of sentences and returns logits for sentiment classes'''
-
+    
     ### TODO: The final GPT contextualized embedding is the hidden state of [CLS] token (the first token).
     ###       HINT: You should consider what is an appropriate return value given that
     ###       the training loop currently uses F.cross_entropy as the loss function.
     ### YOUR CODE HERE
-    raise NotImplementedError
+    # Get GPT2 embeddings
+    outputs = self.gpt(input_ids, attention_mask)
+    
+    # Get the last token's hidden state (for classification)
+    last_hidden_state = outputs['last_token']
+    
+    # Pass through the classification head to get logits
+    logits = self.classifier(last_hidden_state)
+    
+    return logits
 
 
 
@@ -351,11 +364,12 @@ def get_args():
                       help='last-linear-layer: the GPT parameters are frozen and the task specific head parameters are updated; full-model: GPT parameters are updated as well',
                       choices=('last-linear-layer', 'full-model'), default="last-linear-layer")
   parser.add_argument("--use_gpu", action='store_true')
-
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
   parser.add_argument("--lr", type=float, help="learning rate, default lr for 'pretrain': 1e-3, 'finetune': 1e-5",
                       default=1e-3)
+  parser.add_argument("--dev_out", type=str, help="path to dev predictions output file")
+  parser.add_argument("--test_out", type=str, help="path to test predictions output file")
 
   args = parser.parse_args()
   return args
@@ -364,6 +378,11 @@ def get_args():
 if __name__ == "__main__":
   args = get_args()
   seed_everything(args.seed)
+
+  # Get base filenames for predictions if custom paths provided
+  if args.dev_out and args.test_out:
+    base_dev = args.dev_out.replace('sst', 'cfimdb')
+    base_test = args.test_out.replace('sst', 'cfimdb')
 
   print('Training Sentiment Classifier on SST...')
   config = SimpleNamespace(
@@ -377,12 +396,11 @@ if __name__ == "__main__":
     dev='data/ids-sst-dev.csv',
     test='data/ids-sst-test-student.csv',
     fine_tune_mode=args.fine_tune_mode,
-    dev_out='predictions/' + args.fine_tune_mode + '-sst-dev-out.csv',
-    test_out='predictions/' + args.fine_tune_mode + '-sst-test-out.csv'
+    dev_out=args.dev_out if args.dev_out else 'predictions/' + args.fine_tune_mode + '-sst-dev-out.csv',
+    test_out=args.test_out if args.test_out else 'predictions/' + args.fine_tune_mode + '-sst-test-out.csv'
   )
 
   train(config)
-
   print('Evaluating on SST...')
   test(config)
 
@@ -398,11 +416,10 @@ if __name__ == "__main__":
     dev='data/ids-cfimdb-dev.csv',
     test='data/ids-cfimdb-test-student.csv',
     fine_tune_mode=args.fine_tune_mode,
-    dev_out='predictions/' + args.fine_tune_mode + '-cfimdb-dev-out.csv',
-    test_out='predictions/' + args.fine_tune_mode + '-cfimdb-test-out.csv'
+    dev_out=base_dev if args.dev_out else 'predictions/' + args.fine_tune_mode + '-cfimdb-dev-out.csv',
+    test_out=base_test if args.test_out else 'predictions/' + args.fine_tune_mode + '-cfimdb-test-out.csv'
   )
 
   train(config)
-
   print('Evaluating on cfimdb...')
   test(config)
