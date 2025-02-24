@@ -55,12 +55,10 @@ class GPT2SentimentClassifier(torch.nn.Module):
 
     ### TODO: Create any instance variables you need to classify the sentiment of BERT embeddings.
     ### YOUR CODE HERE
-    self.classifier = torch.nn.Sequential(
-        torch.nn.Linear(config.hidden_size, config.hidden_size),
-        torch.nn.Tanh(),
-        torch.nn.Dropout(config.hidden_dropout_prob),
-        torch.nn.Linear(config.hidden_size, self.num_labels)
-    )
+    # Create classification head
+    self.dropout = torch.nn.Dropout(config.hidden_dropout_prob)
+    self.classifier = torch.nn.Linear(config.hidden_size, config.num_labels)
+
 
   def forward(self, input_ids, attention_mask):
     '''Takes a batch of sentences and returns logits for sentiment classes'''
@@ -69,14 +67,16 @@ class GPT2SentimentClassifier(torch.nn.Module):
     ###       HINT: You should consider what is an appropriate return value given that
     ###       the training loop currently uses F.cross_entropy as the loss function.
     ### YOUR CODE HERE
-    # Get GPT2 embeddings
-    outputs = self.gpt(input_ids, attention_mask)
+    # Get GPT2 hidden states
+    outputs = self.gpt(input_ids, attention_mask=attention_mask)
+    hidden_states = outputs.last_hidden_state
     
-    # Get the last token's hidden state (for classification)
-    last_hidden_state = outputs['last_token']
+    # Use the first token ([CLS]) for classification
+    pooled_output = hidden_states[:, 0, :]
     
-    # Pass through the classification head to get logits
-    logits = self.classifier(last_hidden_state)
+    # Apply dropout and classification layer
+    pooled_output = self.dropout(pooled_output)
+    logits = self.classifier(pooled_output)
     
     return logits
 
