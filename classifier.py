@@ -18,6 +18,7 @@ from models.gpt2 import GPT2Model
 from optimizer import AdamW
 from tqdm import tqdm
 
+
 TQDM_DISABLE = False
 
 
@@ -56,9 +57,9 @@ class GPT2SentimentClassifier(torch.nn.Module):
     ### TODO: Create any instance variables you need to classify the sentiment of BERT embeddings.
     ### YOUR CODE HERE
     # Create classification head
+    self.pre_classifier = torch.nn.Linear(config.hidden_size, config.hidden_size)
     self.dropout = torch.nn.Dropout(config.hidden_dropout_prob)
     self.classifier = torch.nn.Linear(config.hidden_size, config.num_labels)
-
 
   def forward(self, input_ids, attention_mask):
     '''Takes a batch of sentences and returns logits for sentiment classes'''
@@ -69,14 +70,17 @@ class GPT2SentimentClassifier(torch.nn.Module):
     ### YOUR CODE HERE
     # Get GPT2 hidden states
     outputs = self.gpt(input_ids, attention_mask=attention_mask)
-    hidden_states = outputs.last_hidden_state
     
-    # Use the first token ([CLS]) for classification
-    pooled_output = hidden_states[:, 0, :]
+    # Get last token representation
+    last_token = outputs['last_token']
     
-    # Apply dropout and classification layer
-    pooled_output = self.dropout(pooled_output)
-    logits = self.classifier(pooled_output)
+    # Transform through pre-classifier
+    hidden_state = self.pre_classifier(last_token)
+    hidden_state = torch.tanh(hidden_state)
+    
+    # Apply dropout and classification
+    hidden_state = self.dropout(hidden_state)
+    logits = self.classifier(hidden_state)
     
     return logits
 
