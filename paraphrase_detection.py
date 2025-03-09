@@ -72,7 +72,25 @@ class ParaphraseGPT(nn.Module):
 
     'Takes a batch of sentences and produces embeddings for them.'
     ### YOUR CODE HERE
-    raise NotImplementedError
+    # Get the output from the GPT-2 model
+    output = self.gpt(input_ids, attention_mask)
+    
+    # Extract the last hidden state
+    last_hidden_state = output['last_hidden_state']
+    
+    # Get the last token's hidden state for each sequence in the batch
+    # We want to predict the next token after the prompt
+    batch_size = input_ids.size(0)
+    last_token_indices = attention_mask.sum(dim=1) - 1
+    
+    # Gather the hidden states for the last token in each sequence
+    last_token_hidden_states = torch.stack([last_hidden_state[i, idx, :] 
+                                           for i, idx in enumerate(last_token_indices)])
+    
+    # Pass through the paraphrase detection head to get logits for "yes" and "no"
+    logits = self.paraphrase_detection_head(last_token_hidden_states)
+    
+    return logits
 
 
 
