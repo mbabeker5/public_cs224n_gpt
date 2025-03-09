@@ -61,7 +61,21 @@ class SonnetGPT(nn.Module):
     not just the distribution over next tokens for the last token!
     """
     ### YOUR CODE HERE
-    raise NotImplementedError
+    # Get the output from the GPT-2 model
+    output = self.gpt(input_ids, attention_mask)
+    
+    # Extract the last hidden state - this contains hidden states for all tokens in the sequence
+    hidden_states = output['last_hidden_state']
+    
+    # For language modeling, we need to predict the next token for each position
+    # We use the GPT2's vocabulary size for the output dimension
+    batch_size, seq_length, hidden_dim = hidden_states.shape
+    
+    # Project the hidden states to the vocabulary size using the GPT2's word embedding matrix
+    # This is a common technique called weight tying
+    logits = F.linear(hidden_states, self.gpt.word_embedding.weight)
+    
+    return logits
 
 
   def get_device(self):
@@ -131,7 +145,7 @@ def save_model(model, optimizer, args, filepath):
 
 
 def train(args):
-  """Train GPT-2 for paraphrase detection on the Quora dataset."""
+  """Train GPT-2 for sonnet generation on the Shakespeare sonnets dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   # Create the data and its corresponding datasets and dataloader.
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
@@ -201,19 +215,27 @@ def generate_submission_sonnets(args):
   generated_sonnets = []
   for batch in held_out_sonnet_dataset:
     sonnet_id = batch[0]
-    encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
-    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
-    decoded_output = model.tokenizer.decode(output)
-    full_sonnet = f'{decoded_output}\n\n'
+    first_three_lines = batch[1]
+    
+    # Tokenize the first three lines to condition the generation
+    encoding = model.tokenizer(first_three_lines, return_tensors='pt', padding=False, truncation=True).to(device)
+    
+    # Generate the rest of the sonnet
+    _, generated_text = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
+    
+    # The generated_text includes the first three lines, so we need to keep the complete sonnet
+    full_sonnet = generated_text
+    
     generated_sonnets.append((sonnet_id, full_sonnet))
+    print(f'Sonnet {sonnet_id}:\n{full_sonnet}\n\n')
 
-    print(f'{decoded_output}\n\n')
-
+  # Write the generated sonnets to the output file
   with open(args.sonnet_out, "w+") as f:
     f.write(f"--Generated Sonnets-- \n\n")
-    for sonnet in generated_sonnets:
-      f.write(f"\n{sonnet[0]}\n")
-      f.write(sonnet[1])
+    for sonnet_id, sonnet_text in generated_sonnets:
+      f.write(f"\n{sonnet_id}\n")
+      f.write(sonnet_text)
+      f.write("\n\n")
 
 
 def get_args():
