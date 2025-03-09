@@ -383,7 +383,7 @@ def generate_submission_sonnets(args):
     best_candidate = candidates[best_idx]
     
     # Format the sonnet for submission
-    generated_sonnets.append(f"{sonnet_id}\t{first_three_lines}{best_candidate}")
+    generated_sonnets.append(f"{sonnet_id}\n{first_three_lines}{best_candidate}")
 
   # Write the generated sonnets to a file.
   with open(args.sonnet_out, 'w') as f:
