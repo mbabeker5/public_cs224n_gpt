@@ -141,10 +141,11 @@ class SonnetGPT(nn.Module):
       # Add sampled token to tracking list
       generated_tokens.append(sampled_token.item())
       
-      # Append sampled token to input
-      token_ids = torch.cat([token_ids, sampled_token.unsqueeze(0)], dim=1)
+      # Append sampled token to input - fix dimension mismatch
+      # Ensure sampled_token has shape [batch_size, 1]
+      token_ids = torch.cat([token_ids, sampled_token], dim=1)
       attention_mask = torch.cat(
-        [attention_mask, torch.ones((1, 1), dtype=torch.int64).to(self.get_device())], dim=1
+        [attention_mask, torch.ones((attention_mask.size(0), 1), dtype=torch.int64).to(self.get_device())], dim=1
       )
 
     generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())[3:]
