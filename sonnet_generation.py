@@ -100,15 +100,8 @@ class SonnetGPT(nn.Module):
     for _ in range(max_length):
       # Forward pass to get logits
       logits_sequence = self.forward(token_ids, attention_mask)
-      logits_last_token = logits_sequence[:, -1, :].clone()
-      
-      # Apply repetition penalty - penalize tokens that appear in the last 50 tokens
-      if repetition_penalty > 1.0:
-        for token_id in set(generated_tokens[-50:]):  # Only consider recent tokens
-          logits_last_token[:, token_id] /= repetition_penalty
-      
-      # Apply temperature scaling
       logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
 
