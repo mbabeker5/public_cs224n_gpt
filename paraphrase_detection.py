@@ -75,12 +75,17 @@ class ParaphraseGPT(nn.Module):
       
     # Then unfreeze only the last num_trainable_layers transformer blocks
     if num_trainable_layers > 0:
-      for i in range(max(0, self.gpt.config.n_layer - num_trainable_layers), self.gpt.config.n_layer):
-        for param in self.gpt.h[i].parameters():
+      # Get the number of layers from the config
+      n_layers = self.gpt.config.num_hidden_layers
+      
+      # Unfreeze the last num_trainable_layers
+      for i in range(max(0, n_layers - num_trainable_layers), n_layers):
+        # The layers are in gpt_layers, not h
+        for param in self.gpt.gpt_layers[i].parameters():
           param.requires_grad = True
       
-      # Also unfreeze the output layer
-      for param in self.gpt.ln_f.parameters():
+      # Also unfreeze the output layer norm
+      for param in self.gpt.final_layer_norm.parameters():
         param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
