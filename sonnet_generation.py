@@ -141,12 +141,6 @@ class SonnetGPT(nn.Module):
       # Add sampled token to tracking list
       generated_tokens.append(sampled_token.item())
       
-      # Append sampled token to input - fix dimension mismatch
-      # Ensure sampled_token has shape [batch_size, 1]
-      token_ids = torch.cat([token_ids, sampled_token], dim=1)
-      attention_mask = torch.cat(
-        [attention_mask, torch.ones((attention_mask.size(0), 1), dtype=torch.int64).to(self.get_device())], dim=1
-      )
 
     generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())[3:]
     return token_ids, generated_output
@@ -272,26 +266,74 @@ def generate_submission_sonnets(args):
     sonnet_id = batch[0]
     first_three_lines = batch[1]
     
-    # Try multiple generations and pick the best one
+    # Try multiple generations with different parameters and pick the best one
     best_sonnet = None
     best_score = -float('inf')
     
-    for _ in range(3):  # Generate 3 candidates
+    # Generate more candidates with varied parameters
+    num_candidates = 5  # Increased from 3 to 5
+    
+    # Define parameter variations for diverse generation
+    temperature_variations = [args.temperature, args.temperature - 0.05, args.temperature + 0.05]
+    top_p_variations = [args.top_p, args.top_p - 0.05, args.top_p + 0.05]
+    repetition_penalty_variations = [args.repetition_penalty, args.repetition_penalty + 0.1]
+    
+    for i in range(num_candidates):
+      # Select parameters with some variation to encourage diversity
+      temp = temperature_variations[i % len(temperature_variations)]
+      p = top_p_variations[i % len(top_p_variations)]
+      rep_penalty = repetition_penalty_variations[i % len(repetition_penalty_variations)]
+      
       # Tokenize the first three lines to condition the generation
       encoding = model.tokenizer(first_three_lines, return_tensors='pt', padding=False, truncation=True).to(device)
       
-      # Generate the rest of the sonnet
+      # Generate the rest of the sonnet with varied parameters
       _, generated_text = model.generate(
           encoding['input_ids'], 
-          temperature=args.temperature, 
-          top_p=args.top_p,
-          repetition_penalty=args.repetition_penalty
+          temperature=temp, 
+          top_p=p,
+          repetition_penalty=rep_penalty,
+          max_length=150  # Slightly increased max length
       )
       
-      # Simple heuristic to score sonnets - prefer those with more line breaks and fewer repetitions
-      line_count = generated_text.count('\n')
-      repeated_phrases = sum(1 for phrase in generated_text.split() if generated_text.count(phrase) > 1 and len(phrase) > 3)
-      score = line_count - (repeated_phrases * 0.5)
+      # Improved scoring heuristic for sonnets
+      # Count lines (sonnets should have 14 lines)
+      line_count = generated_text.count('\n') + 1
+      line_score = 0
+      if 13 <= line_count <= 15:  # Prefer sonnets with close to 14 lines
+          line_score = 10
+      elif 10 <= line_count <= 16:
+          line_score = 5
+      
+      # Check for repetition of phrases (penalize repetition)
+      words = generated_text.split()
+      phrases = [' '.join(words[i:i+3]) for i in range(len(words)-2)]
+      phrase_counts = {}
+      for phrase in phrases:
+          if len(phrase) > 5:  # Only consider meaningful phrases
+              phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
+      
+      repetition_score = -sum(count-1 for count in phrase_counts.values() if count > 1)
+      
+      # Check for rhyming pattern (simple heuristic - look at last words of lines)
+      lines = generated_text.strip().split('\n')
+      if len(lines) >= 8:
+          # Extract last word of each line
+          last_words = [line.split()[-1] if line.split() else "" for line in lines]
+          # Simple rhyme detection - check if alternate lines end with similar characters
+          rhyme_pairs = 0
+          for i in range(0, len(last_words)-2, 2):
+              if i+1 < len(last_words):
+                  word1 = last_words[i]
+                  word2 = last_words[i+1]
+                  if len(word1) > 2 and len(word2) > 2 and word1[-2:] == word2[-2:]:
+                      rhyme_pairs += 1
+          rhyme_score = rhyme_pairs * 2
+      else:
+          rhyme_score = 0
+      
+      # Calculate final score
+      score = line_score + repetition_score + rhyme_score
       
       if best_sonnet is None or score > best_score:
         best_sonnet = generated_text
@@ -301,7 +343,7 @@ def generate_submission_sonnets(args):
     full_sonnet = best_sonnet
     
     generated_sonnets.append((sonnet_id, full_sonnet))
-    print(f'Sonnet {sonnet_id}:\n{full_sonnet}\n\n')
+    print(f'Sonnet {sonnet_id} (score: {best_score}):\n{full_sonnet}\n\n')
 
   # Write the generated sonnets to the output file
   with open(args.sonnet_out, "w+") as f:
@@ -324,12 +366,12 @@ def get_args():
   parser.add_argument("--epochs", type=int, default=15)
   parser.add_argument("--use_gpu", action='store_true')
 
-  # Generation parameters - adjusted for better performance
-  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=0.7)  # Lower temperature 0.8 to 0.7  
+  # Generation parameters - further optimized
+  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=0.65)  # Further reduced temperature
   parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
-                      default=0.9)  # Slightly lower top_p 0.9 to 0.92
+                      default=0.85)  # Further reduced top_p
   parser.add_argument("--repetition_penalty", type=float, help="Penalty to reduce repetition in generated text.",
-                      default=1.3)  # Increased repetition penalty from 0.9 to 1.3
+                      default=1.4)  # Further increased repetition penalty
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
   # 5e-5 learning rate
