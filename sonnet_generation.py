@@ -95,17 +95,17 @@ class SonnetGPT(nn.Module):
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
 
-    # Keep track of previously generated tokens to apply repetition penalty
-    prev_tokens = set()
-
+    # Track generated tokens for repetition penalty
+    generated_tokens = token_ids[0].tolist()  # Start with initial tokens
+    
     for _ in range(max_length):
       # Forward pass to get logits
       logits_sequence = self.forward(token_ids, attention_mask)
       logits_last_token = logits_sequence[:, -1, :].clone()
       
-      # Apply repetition penalty to discourage repetitive phrases
-      if len(prev_tokens) > 0:
-        for token_id in prev_tokens:
+      # Apply repetition penalty - penalize tokens that appear in the last 50 tokens
+      if repetition_penalty > 1.0:
+        for token_id in set(generated_tokens[-50:]):  # Only consider recent tokens
           logits_last_token[:, token_id] /= repetition_penalty
       
       # Apply temperature scaling
@@ -117,25 +117,32 @@ class SonnetGPT(nn.Module):
       # Top-p (nucleus) sampling
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
       cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-      top_p_mask = cumulative_probs <= top_p
-      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding
-      top_p_mask[..., 0] = True  # Always include the highest probability token
-      filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
-      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
+      
+      # Create mask for tokens within top_p probability mass
+      sorted_indices_to_remove = cumulative_probs > top_p
+      # Shift indices to keep first token above threshold
+      sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+      sorted_indices_to_remove[..., 0] = 0
+      
+      # Apply mask to probabilities
+      indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+      probs = probs.masked_fill(indices_to_remove, 0.0)
+      
+      # Renormalize probabilities
+      probs = probs / probs.sum(dim=-1, keepdim=True)
 
       # Sample from filtered distribution
-      sampled_index = torch.multinomial(filtered_probs, 1)
-      sampled_token = sorted_indices.gather(dim=-1, index=sampled_index)
+      sampled_token = torch.multinomial(probs, 1)
       
-      # Add to set of previously generated tokens (for repetition penalty)
-      prev_tokens.add(sampled_token.item())
-
       # Stop if end-of-sequence token is reached
       if sampled_token.item() == self.tokenizer.eos_token_id:
         break
 
-      # Append sampled token
-      token_ids = torch.cat([token_ids, sampled_token], dim=1)
+      # Add sampled token to tracking list
+      generated_tokens.append(sampled_token.item())
+      
+      # Append sampled token to input
+      token_ids = torch.cat([token_ids, sampled_token.unsqueeze(0)], dim=1)
       attention_mask = torch.cat(
         [attention_mask, torch.ones((1, 1), dtype=torch.int64).to(self.get_device())], dim=1
       )
@@ -182,7 +189,7 @@ def train(args):
   
   best_train_loss = float('inf')
   patience_counter = 0
-  early_stop_patience = 3  # Stop if no improvement for 3 epochs
+  early_stop_patience = 5  # Increased patience from 3 to 5 to allow more training
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
@@ -264,19 +271,33 @@ def generate_submission_sonnets(args):
     sonnet_id = batch[0]
     first_three_lines = batch[1]
     
-    # Tokenize the first three lines to condition the generation
-    encoding = model.tokenizer(first_three_lines, return_tensors='pt', padding=False, truncation=True).to(device)
+    # Try multiple generations and pick the best one
+    best_sonnet = None
+    best_score = -float('inf')
     
-    # Generate the rest of the sonnet with repetition penalty
-    _, generated_text = model.generate(
-        encoding['input_ids'], 
-        temperature=args.temperature, 
-        top_p=args.top_p,
-        repetition_penalty=args.repetition_penalty
-    )
+    for _ in range(3):  # Generate 3 candidates
+      # Tokenize the first three lines to condition the generation
+      encoding = model.tokenizer(first_three_lines, return_tensors='pt', padding=False, truncation=True).to(device)
+      
+      # Generate the rest of the sonnet
+      _, generated_text = model.generate(
+          encoding['input_ids'], 
+          temperature=args.temperature, 
+          top_p=args.top_p,
+          repetition_penalty=args.repetition_penalty
+      )
+      
+      # Simple heuristic to score sonnets - prefer those with more line breaks and fewer repetitions
+      line_count = generated_text.count('\n')
+      repeated_phrases = sum(1 for phrase in generated_text.split() if generated_text.count(phrase) > 1 and len(phrase) > 3)
+      score = line_count - (repeated_phrases * 0.5)
+      
+      if best_sonnet is None or score > best_score:
+        best_sonnet = generated_text
+        best_score = score
     
-    # The generated_text includes the first three lines, so we need to keep the complete sonnet
-    full_sonnet = generated_text
+    # The generated_text includes the first three lines, so we keep the complete sonnet
+    full_sonnet = best_sonnet
     
     generated_sonnets.append((sonnet_id, full_sonnet))
     print(f'Sonnet {sonnet_id}:\n{full_sonnet}\n\n')
@@ -302,14 +323,12 @@ def get_args():
   parser.add_argument("--epochs", type=int, default=15)
   parser.add_argument("--use_gpu", action='store_true')
 
-  # Generation parameters.
-  # 0.8 temperature
-  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=0.8)
-  # 0.92 top_p
+  # Generation parameters - adjusted for better performance
+  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=0.7)  # Lower temperature 0.8 to 0.7  
   parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
-                      default=0.92)
+                      default=0.9)  # Slightly lower top_p 0.9 to 0.92
   parser.add_argument("--repetition_penalty", type=float, help="Penalty to reduce repetition in generated text.",
-                      default=1.2)
+                      default=1.3)  # Increased repetition penalty from 0.9 to 1.3
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
   # 5e-5 learning rate
