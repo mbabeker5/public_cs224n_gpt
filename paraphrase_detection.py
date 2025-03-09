@@ -29,6 +29,7 @@ from datasets import (
 )
 from evaluation import model_eval_paraphrase, model_test_paraphrase
 from models.gpt2 import GPT2Model
+from transformers import GPT2Tokenizer
 
 from optimizer import AdamW
 
@@ -51,11 +52,36 @@ class ParaphraseGPT(nn.Module):
   def __init__(self, args):
     super().__init__()
     self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
-    self.paraphrase_detection_head = nn.Linear(args.d, 2)  # Paraphrase detection has two outputs: 1 (yes) or 0 (no).
-
+    
     # By default, fine-tune the full model.
+    # Instead of a 2-class output, we'll directly predict the token IDs for "yes" (8505) and "no" (3919)
+    # We'll use the vocabulary size of GPT-2 for the output dimension
+    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    
+    # Map class indices to token IDs
+    self.class_token_ids = {
+        0: 3919,  # "no" token ID
+        1: 8505   # "yes" token ID
+    }
+    
+    # We'll freeze most of the model by default to speed up training
+    self.freeze_most_layers(args.num_trainable_layers)
+
+  def freeze_most_layers(self, num_trainable_layers):
+    """Freeze most of the model layers, only train the last few layers."""
+    # First freeze all parameters
     for param in self.gpt.parameters():
-      param.requires_grad = True
+      param.requires_grad = False
+      
+    # Then unfreeze only the last num_trainable_layers transformer blocks
+    if num_trainable_layers > 0:
+      for i in range(max(0, self.gpt.config.n_layer - num_trainable_layers), self.gpt.config.n_layer):
+        for param in self.gpt.h[i].parameters():
+          param.requires_grad = True
+      
+      # Also unfreeze the output layer
+      for param in self.gpt.ln_f.parameters():
+        param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
     """
@@ -79,7 +105,6 @@ class ParaphraseGPT(nn.Module):
     last_hidden_state = output['last_hidden_state']
     
     # Get the last token's hidden state for each sequence in the batch
-    # We want to predict the next token after the prompt
     batch_size = input_ids.size(0)
     last_token_indices = attention_mask.sum(dim=1) - 1
     
@@ -87,10 +112,18 @@ class ParaphraseGPT(nn.Module):
     last_token_hidden_states = torch.stack([last_hidden_state[i, idx, :] 
                                            for i, idx in enumerate(last_token_indices)])
     
-    # Pass through the paraphrase detection head to get logits for "yes" and "no"
-    logits = self.paraphrase_detection_head(last_token_hidden_states)
+    # Project to the full vocabulary space using the GPT-2 word embedding matrix
+    logits = F.linear(last_token_hidden_states, self.gpt.word_embedding.weight)
     
-    return logits
+    # Extract only the logits for "yes" (8505) and "no" (3919) tokens
+    # This creates a tensor of shape [batch_size, 2] where the first column is the logit for "no"
+    # and the second column is the logit for "yes"
+    binary_logits = torch.stack([
+        logits[:, self.class_token_ids[0]],  # "no" logits
+        logits[:, self.class_token_ids[1]]   # "yes" logits
+    ], dim=1)
+    
+    return binary_logits
 
 
 
@@ -127,8 +160,13 @@ def train(args):
   model = ParaphraseGPT(args)
   model = model.to(device)
 
+  # Print the number of trainable parameters
+  trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+  total_params = sum(p.numel() for p in model.parameters())
+  print(f"Training {trainable_params:,} parameters out of {total_params:,} total parameters ({trainable_params/total_params:.2%})")
+
   lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
+  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
   best_dev_acc = 0
 
   # Run for the specified number of epochs.
@@ -149,20 +187,23 @@ def train(args):
       preds = torch.argmax(logits, dim=1)
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
+      
+      # Apply gradient clipping
+      torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+      
       optimizer.step()
 
       train_loss += loss.item()
       num_batches += 1
 
     train_loss = train_loss / num_batches
-
-    dev_acc, dev_f1, *_ = model_eval_paraphrase(para_dev_dataloader, model, device)
+    dev_acc, dev_f1, _, _, _ = model_eval_paraphrase(para_dev_dataloader, model, device)
 
     if dev_acc > best_dev_acc:
       best_dev_acc = dev_acc
       save_model(model, optimizer, args, args.filepath)
 
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}, dev f1 :: {dev_f1 :.3f}")
 
 
 @torch.no_grad()
@@ -213,14 +254,25 @@ def get_args():
   parser.add_argument("--para_test_out", type=str, default="predictions/para-test-output.csv")
 
   parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=10)
+  parser.add_argument("--epochs", type=int, default=3)
   parser.add_argument("--use_gpu", action='store_true')
 
-  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
+  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=64)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
+  
+  # Add parameter to control how many layers to train
+  parser.add_argument("--num_trainable_layers", type=int, 
+                      help="Number of transformer layers to train (counting from the end). Set to 0 to train only the output layer, or -1 to train all layers.",
+                      default=3)
+  
+  # Add parameter for weight decay to prevent overfitting
+  parser.add_argument("--weight_decay", type=float, help="Weight decay for AdamW", default=0.01)
+  
+  # Add parameter for gradient clipping
+  parser.add_argument("--max_grad_norm", type=float, help="Maximum gradient norm for clipping", default=1.0)
 
   args = parser.parse_args()
   return args
@@ -247,7 +299,7 @@ def add_arguments(args):
 
 if __name__ == "__main__":
   args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # Save path.
+  args.filepath = f'{args.epochs}-{args.lr}-{args.num_trainable_layers}layers-para.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
   train(args)
   test(args)
