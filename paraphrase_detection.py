@@ -241,12 +241,16 @@ def test(args):
   with open(args.para_dev_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
-      f.write(f"{p}, {s} \n")
+      # Convert binary prediction to token ID (0 -> 3919, 1 -> 8505)
+      token_id = 8505 if s == 1 else 3919
+      f.write(f"{p}, {token_id} \n")
 
   with open(args.para_test_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(test_para_sent_ids, test_para_y_pred):
-      f.write(f"{p}, {s} \n")
+      # Convert binary prediction to token ID (0 -> 3919, 1 -> 8505)
+      token_id = 8505 if s == 1 else 3919
+      f.write(f"{p}, {token_id} \n")
 
 
 def get_args():
