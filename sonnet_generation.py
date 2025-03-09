@@ -83,7 +83,8 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  #Added repetition_penalty to discourage repetitive phrases and improve the quality of generated sonnets.
+  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128, repetition_penalty=1.2):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -94,11 +95,21 @@ class SonnetGPT(nn.Module):
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
 
+    # Keep track of previously generated tokens to apply repetition penalty
+    prev_tokens = set()
 
     for _ in range(max_length):
       # Forward pass to get logits
       logits_sequence = self.forward(token_ids, attention_mask)
-      logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+      logits_last_token = logits_sequence[:, -1, :].clone()
+      
+      # Apply repetition penalty to discourage repetitive phrases
+      if len(prev_tokens) > 0:
+        for token_id in prev_tokens:
+          logits_last_token[:, token_id] /= repetition_penalty
+      
+      # Apply temperature scaling
+      logits_last_token = logits_last_token / temperature
 
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
@@ -115,6 +126,9 @@ class SonnetGPT(nn.Module):
       # Sample from filtered distribution
       sampled_index = torch.multinomial(filtered_probs, 1)
       sampled_token = sorted_indices.gather(dim=-1, index=sampled_index)
+      
+      # Add to set of previously generated tokens (for repetition penalty)
+      prev_tokens.add(sampled_token.item())
 
       # Stop if end-of-sequence token is reached
       if sampled_token.item() == self.tokenizer.eos_token_id:
@@ -161,6 +175,14 @@ def train(args):
 
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
+  
+  # Add learning rate scheduler
+  total_steps = len(sonnet_dataloader) * args.epochs
+  scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+  
+  best_train_loss = float('inf')
+  patience_counter = 0
+  early_stop_patience = 3  # Stop if no improvement for 3 epochs
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
@@ -182,12 +204,26 @@ def train(args):
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
+      scheduler.step()
 
       train_loss += loss.item()
       num_batches += 1
 
     train_loss = train_loss / num_batches
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
+    
+    # Check for early stopping
+    if train_loss < best_train_loss:
+      best_train_loss = train_loss
+      patience_counter = 0
+      # Save the best model
+      save_model(model, optimizer, args, f'best_{args.filepath}')
+    else:
+      patience_counter += 1
+      if patience_counter >= early_stop_patience:
+        print(f"Early stopping triggered after {epoch+1} epochs")
+        break
+    
     print('Generating several output sonnets...')
     model.eval()
     for batch in held_out_sonnet_dataset:
@@ -201,8 +237,19 @@ def train(args):
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
+  """
+  Generate sonnets for submission by conditioning on the first 3 lines of each test sonnet.
+  The model will complete the rest of the sonnet (lines 4-14).
+  """
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  
+  # Try to load the best model first, fall back to the last epoch model if not available
+  try:
+    saved = torch.load(f'best_{args.filepath}', weights_only=False)
+    print(f"Using best model from best_{args.filepath}")
+  except:
+    saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+    print(f"Using last epoch model from {args.epochs-1}_{args.filepath}")
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -220,8 +267,13 @@ def generate_submission_sonnets(args):
     # Tokenize the first three lines to condition the generation
     encoding = model.tokenizer(first_three_lines, return_tensors='pt', padding=False, truncation=True).to(device)
     
-    # Generate the rest of the sonnet
-    _, generated_text = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
+    # Generate the rest of the sonnet with repetition penalty
+    _, generated_text = model.generate(
+        encoding['input_ids'], 
+        temperature=args.temperature, 
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty
+    )
     
     # The generated_text includes the first three lines, so we need to keep the complete sonnet
     full_sonnet = generated_text
@@ -246,16 +298,22 @@ def get_args():
   parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets.txt")
 
   parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=10)
+  # 15 epochs
+  parser.add_argument("--epochs", type=int, default=15)
   parser.add_argument("--use_gpu", action='store_true')
 
   # Generation parameters.
-  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
+  # 0.8 temperature
+  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=0.8)
+  # 0.92 top_p
   parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
-                      default=0.9)
+                      default=0.92)
+  parser.add_argument("--repetition_penalty", type=float, help="Penalty to reduce repetition in generated text.",
+                      default=1.2)
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
-  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  # 5e-5 learning rate
+  parser.add_argument("--lr", type=float, help="learning rate", default=5e-5)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
 
