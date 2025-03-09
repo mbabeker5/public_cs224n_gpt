@@ -63,7 +63,7 @@ class SonnetGPT(nn.Module):
     ### YOUR CODE HERE
     # Get the output from the GPT-2 model
     output = self.gpt(input_ids, attention_mask)
-    
+
     # Extract the last hidden state - this contains hidden states for all tokens in the sequence
     hidden_states = output['last_hidden_state']
     
@@ -83,8 +83,7 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  #Added repetition_penalty to discourage repetitive phrases and improve the quality of generated sonnets.
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128, repetition_penalty=1.2):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -109,38 +108,32 @@ class SonnetGPT(nn.Module):
           logits_last_token[:, token_id] /= repetition_penalty
       
       # Apply temperature scaling
-      logits_last_token = logits_last_token / temperature
-
+      logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
 
       # Top-p (nucleus) sampling
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
       cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-      
-      # Create mask for tokens within top_p probability mass
-      sorted_indices_to_remove = cumulative_probs > top_p
-      # Shift indices to keep first token above threshold
-      sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-      sorted_indices_to_remove[..., 0] = 0
-      
-      # Apply mask to probabilities
-      indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-      probs = probs.masked_fill(indices_to_remove, 0.0)
-      
-      # Renormalize probabilities
-      probs = probs / probs.sum(dim=-1, keepdim=True)
+      top_p_mask = cumulative_probs <= top_p
+      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding        
+      top_p_mask[..., 0] = True  # Always include the highest probability token
+      filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
+      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
 
       # Sample from filtered distribution
-      sampled_token = torch.multinomial(probs, 1)
-      
+      sampled_index = torch.multinomial(filtered_probs, 1)
+      sampled_token = sorted_indices.gather(dim=-1, index=sampled_index)
+
       # Stop if end-of-sequence token is reached
       if sampled_token.item() == self.tokenizer.eos_token_id:
         break
 
-      # Add sampled token to tracking list
-      generated_tokens.append(sampled_token.item())
-      
+      # Append sampled token
+      token_ids = torch.cat([token_ids, sampled_token], dim=1)
+      attention_mask = torch.cat(
+        [attention_mask, torch.ones((1, 1), dtype=torch.int64).to(self.get_device())], dim=1
+      )
 
     generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())[3:]
     return token_ids, generated_output
@@ -178,14 +171,11 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
   
-  # Add learning rate scheduler
-  total_steps = len(sonnet_dataloader) * args.epochs
-  scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
-  
+  # Add early stopping mechanism
   best_train_loss = float('inf')
   patience_counter = 0
-  early_stop_patience = 5  # Increased patience from 3 to 5 to allow more training
-
+  early_stop_patience = 3  # Stop after 3 epochs without improvement
+  
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
     model.train()
@@ -206,7 +196,6 @@ def train(args):
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
-      scheduler.step()
 
       train_loss += loss.item()
       num_batches += 1
@@ -265,85 +254,18 @@ def generate_submission_sonnets(args):
   for batch in held_out_sonnet_dataset:
     sonnet_id = batch[0]
     first_three_lines = batch[1]
-    
-    # Try multiple generations with different parameters and pick the best one
-    best_sonnet = None
-    best_score = -float('inf')
-    
-    # Generate more candidates with varied parameters
-    num_candidates = 5  # Increased from 3 to 5
-    
-    # Define parameter variations for diverse generation
-    temperature_variations = [args.temperature, args.temperature - 0.05, args.temperature + 0.05]
-    top_p_variations = [args.top_p, args.top_p - 0.05, args.top_p + 0.05]
-    repetition_penalty_variations = [args.repetition_penalty, args.repetition_penalty + 0.1]
-    
-    for i in range(num_candidates):
-      # Select parameters with some variation to encourage diversity
-      temp = temperature_variations[i % len(temperature_variations)]
-      p = top_p_variations[i % len(top_p_variations)]
-      rep_penalty = repetition_penalty_variations[i % len(repetition_penalty_variations)]
-      
-      # Tokenize the first three lines to condition the generation
-      encoding = model.tokenizer(first_three_lines, return_tensors='pt', padding=False, truncation=True).to(device)
-      
-      # Generate the rest of the sonnet with varied parameters
-      _, generated_text = model.generate(
-          encoding['input_ids'], 
-          temperature=temp, 
-          top_p=p,
-          repetition_penalty=rep_penalty,
-          max_length=150  # Slightly increased max length
-      )
-      
-      # Improved scoring heuristic for sonnets
-      # Count lines (sonnets should have 14 lines)
-      line_count = generated_text.count('\n') + 1
-      line_score = 0
-      if 13 <= line_count <= 15:  # Prefer sonnets with close to 14 lines
-          line_score = 10
-      elif 10 <= line_count <= 16:
-          line_score = 5
-      
-      # Check for repetition of phrases (penalize repetition)
-      words = generated_text.split()
-      phrases = [' '.join(words[i:i+3]) for i in range(len(words)-2)]
-      phrase_counts = {}
-      for phrase in phrases:
-          if len(phrase) > 5:  # Only consider meaningful phrases
-              phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
-      
-      repetition_score = -sum(count-1 for count in phrase_counts.values() if count > 1)
-      
-      # Check for rhyming pattern (simple heuristic - look at last words of lines)
-      lines = generated_text.strip().split('\n')
-      if len(lines) >= 8:
-          # Extract last word of each line
-          last_words = [line.split()[-1] if line.split() else "" for line in lines]
-          # Simple rhyme detection - check if alternate lines end with similar characters
-          rhyme_pairs = 0
-          for i in range(0, len(last_words)-2, 2):
-              if i+1 < len(last_words):
-                  word1 = last_words[i]
-                  word2 = last_words[i+1]
-                  if len(word1) > 2 and len(word2) > 2 and word1[-2:] == word2[-2:]:
-                      rhyme_pairs += 1
-          rhyme_score = rhyme_pairs * 2
-      else:
-          rhyme_score = 0
-      
-      # Calculate final score
-      score = line_score + repetition_score + rhyme_score
-      
-      if best_sonnet is None or score > best_score:
-        best_sonnet = generated_text
-        best_score = score
-    
-    # The generated_text includes the first three lines, so we keep the complete sonnet
-    full_sonnet = best_sonnet
-    
+
+    # Tokenize the first three lines to condition the generation
+    encoding = model.tokenizer(first_three_lines, return_tensors='pt', padding=False, truncation=True).to(device)
+
+    # Generate the rest of the sonnet
+    _, generated_text = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
+
+    # The generated_text includes the first three lines, so we need to keep the complete sonnet
+    full_sonnet = generated_text
+
     generated_sonnets.append((sonnet_id, full_sonnet))
-    print(f'Sonnet {sonnet_id} (score: {best_score}):\n{full_sonnet}\n\n')
+    print(f'Sonnet {sonnet_id}:\n{full_sonnet}\n\n')
 
   # Write the generated sonnets to the output file
   with open(args.sonnet_out, "w+") as f:
@@ -362,20 +284,16 @@ def get_args():
   parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets.txt")
 
   parser.add_argument("--seed", type=int, default=11711)
-  # 15 epochs
-  parser.add_argument("--epochs", type=int, default=15)
+  parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
 
-  # Generation parameters - further optimized
-  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=0.65)  # Further reduced temperature
+  # Generation parameters.
+  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
   parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
-                      default=0.85)  # Further reduced top_p
-  parser.add_argument("--repetition_penalty", type=float, help="Penalty to reduce repetition in generated text.",
-                      default=1.4)  # Further increased repetition penalty
+                      default=0.9)
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
-  # 5e-5 learning rate
-  parser.add_argument("--lr", type=float, help="learning rate", default=5e-5)
+  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
 
