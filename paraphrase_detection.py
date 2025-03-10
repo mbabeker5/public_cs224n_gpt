@@ -63,12 +63,23 @@ class ParaphraseGPT(nn.Module):
         1: 8505   # "yes" token ID
     }
     
-    # Add a classification head for better performance
     # Use args.d instead of config.n_embd since we're using a custom GPT2 implementation
     self.hidden_size = args.d
+    
+    # Add attention pooling layer
+    self.attention_pool = nn.Sequential(
+        nn.Linear(self.hidden_size, 1),
+        nn.Softmax(dim=1)
+    )
+    
+    # Enhanced classification head with dropout and layer normalization
     self.classifier = nn.Sequential(
+        nn.LayerNorm(self.hidden_size),
+        nn.Dropout(0.1),
         nn.Linear(self.hidden_size, self.hidden_size),
-        nn.Tanh(),
+        nn.GELU(),
+        nn.LayerNorm(self.hidden_size),
+        nn.Dropout(0.1),
         nn.Linear(self.hidden_size, 2)
     )
     
@@ -117,16 +128,29 @@ class ParaphraseGPT(nn.Module):
     # Extract the last hidden state
     last_hidden_state = output['last_hidden_state']
     
-    # Get the last token's hidden state for each sequence in the batch
+    # Apply attention pooling over the sequence
+    # First, mask out padding tokens
+    extended_attention_mask = attention_mask.unsqueeze(-1)
+    
+    # Apply attention pooling to get a weighted sum of all token representations
+    attention_weights = self.attention_pool(last_hidden_state)
+    attention_weights = attention_weights * extended_attention_mask
+    attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
+    
+    # Get weighted representation
+    weighted_hidden_states = (last_hidden_state * attention_weights).sum(dim=1)
+    
+    # Also get the last token's hidden state for each sequence in the batch
     batch_size = input_ids.size(0)
     last_token_indices = attention_mask.sum(dim=1) - 1
-    
-    # Gather the hidden states for the last token in each sequence
     last_token_hidden_states = torch.stack([last_hidden_state[i, idx, :] 
                                            for i, idx in enumerate(last_token_indices)])
     
-    # Use our classifier to get better predictions
-    logits = self.classifier(last_token_hidden_states)
+    # Combine the weighted representation with the last token representation
+    combined_representation = weighted_hidden_states + last_token_hidden_states
+    
+    # Use our enhanced classifier to get better predictions
+    logits = self.classifier(combined_representation)
     
     return logits
 
@@ -174,7 +198,7 @@ def train(args):
   optimizer = AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
   
   # Add a learning rate scheduler for better convergence
-  total_steps = len(para_train_dataloader) * args.epochs
+  total_steps = len(para_train_dataloader) * args.epochs // args.gradient_accumulation_steps
   warmup_steps = int(0.1 * total_steps)  # 10% of total steps for warmup
   
   # Use a simpler learning rate scheduler for compatibility
@@ -192,7 +216,8 @@ def train(args):
     model.train()
     train_loss = 0
     num_batches = 0
-    for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+    optimizer.zero_grad()  # Zero gradients at the beginning of epoch
+    for batch_idx, batch in enumerate(tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE)):
       # Get the input and move it to the gpu (I do not recommend training this model on CPU).
       b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
       b_ids = b_ids.to(device)
@@ -200,20 +225,23 @@ def train(args):
       labels = labels.to(device)
 
       # Compute the loss, gradients, and update the model's parameters.
-      optimizer.zero_grad()
       logits = model(b_ids, b_mask)
       
       # Apply cross entropy loss without label smoothing to ensure compatibility
       loss = F.cross_entropy(logits, labels, reduction='mean')
+      # Scale the loss by gradient accumulation steps
+      loss = loss / args.gradient_accumulation_steps
       loss.backward()
       
-      # Apply gradient clipping
-      torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-      
-      optimizer.step()
-      scheduler.step()  # Update learning rate
+      # Update weights only after accumulating enough gradients
+      if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(para_train_dataloader):
+        # Apply gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        optimizer.step()
+        scheduler.step()  # Update learning rate
+        optimizer.zero_grad()  # Zero gradients after update
 
-      train_loss += loss.item()
+      train_loss += loss.item() * args.gradient_accumulation_steps  # Adjust for scaling
       num_batches += 1
 
     train_loss = train_loss / num_batches
@@ -277,23 +305,26 @@ def get_args():
   parser.add_argument("--para_dev_out", type=str, default="predictions/para-dev-output.csv")
   parser.add_argument("--para_test_out", type=str, default="predictions/para-test-output.csv")
 
-  parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, help="Number of epochs to train", default=5)
+  parser.add_argument("--seed", type=int, default=42)
+  parser.add_argument("--epochs", type=int, help="Number of epochs to train", default=6)
   parser.add_argument("--use_gpu", action='store_true')
 
-  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=64)
-  parser.add_argument("--lr", type=float, help="Learning rate", default=5e-5)
+  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=32)
+  parser.add_argument("--lr", type=float, help="Learning rate", default=2e-5)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
-                      choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
+                      choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2-medium')
+  
+  # Add parameter for gradient accumulation
+  parser.add_argument("--gradient_accumulation_steps", type=int, help="Number of steps to accumulate gradients", default=2)
   
   # Add parameter to control how many layers to train
   parser.add_argument("--num_trainable_layers", type=int, 
                       help="Number of transformer layers to train (counting from the end). Set to 0 to train only the output layer, or -1 to train all layers.",
-                      default=4)
+                      default=6)
   
   # Add parameter for weight decay to prevent overfitting
-  parser.add_argument("--weight_decay", type=float, help="Weight decay for AdamW", default=0.05)
+  parser.add_argument("--weight_decay", type=float, help="Weight decay for AdamW", default=0.01)
   
   # Add parameter for gradient clipping
   parser.add_argument("--max_grad_norm", type=float, help="Maximum gradient norm for clipping", default=1.0)
