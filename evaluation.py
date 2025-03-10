@@ -36,6 +36,11 @@ def model_eval_paraphrase(dataloader, model, device):
     y_true.extend(labels)
     y_pred.extend(preds)
     sent_ids.extend(b_sent_ids)
+    
+    # Free up memory
+    del b_ids, b_mask, logits
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
   f1 = f1_score(y_true, y_pred, average='macro')
   acc = accuracy_score(y_true, y_pred)
@@ -58,6 +63,11 @@ def model_test_paraphrase(dataloader, model, device):
 
     y_pred.extend(preds)
     sent_ids.extend(b_sent_ids)
+    
+    # Free up memory
+    del b_ids, b_mask, logits
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
   return y_pred, sent_ids
 

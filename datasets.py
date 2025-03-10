@@ -44,20 +44,14 @@ class ParaphraseDetectionDataset(Dataset):
     labels = torch.LongTensor([x[2] for x in all_data])
     sent_ids = [x[3] for x in all_data]
 
-    # Improved prompt format with clearer instructions and structure
+    # Balanced prompt format - informative but memory-efficient
     cloze_style_sents = [
-        f'Task: Determine if the following two questions are paraphrases (asking the same thing in different words).\n\n'
-        f'Question 1: "{s1}"\n'
-        f'Question 2: "{s2}"\n\n'
-        f'Analysis: Let me compare these questions carefully.\n'
-        f'- Question 1 is asking about: {s1}\n'
-        f'- Question 2 is asking about: {s2}\n\n'
-        f'Conclusion: Are these questions paraphrases of each other? '
+        f'Question 1: "{s1}"\nQuestion 2: "{s2}"\nAre these questions paraphrases? '
         for (s1, s2) in zip(sent1, sent2)
     ]
     
     encoding = self.tokenizer(cloze_style_sents, return_tensors='pt', padding=True, truncation=True, 
-                             max_length=512)  # Ensure we use enough context
+                             max_length=192)  # Balanced sequence length
 
     token_ids = torch.LongTensor(encoding['input_ids'])
     attention_mask = torch.LongTensor(encoding['attention_mask'])
@@ -90,20 +84,14 @@ class ParaphraseDetectionTestDataset(Dataset):
     sent2 = [x[1] for x in all_data]
     sent_ids = [x[2] for x in all_data]
 
-    # Use the same improved prompt format as the training dataset
+    # Balanced prompt format - informative but memory-efficient
     cloze_style_sents = [
-        f'Task: Determine if the following two questions are paraphrases (asking the same thing in different words).\n\n'
-        f'Question 1: "{s1}"\n'
-        f'Question 2: "{s2}"\n\n'
-        f'Analysis: Let me compare these questions carefully.\n'
-        f'- Question 1 is asking about: {s1}\n'
-        f'- Question 2 is asking about: {s2}\n\n'
-        f'Conclusion: Are these questions paraphrases of each other? '
+        f'Question 1: "{s1}"\nQuestion 2: "{s2}"\nAre these questions paraphrases? '
         for (s1, s2) in zip(sent1, sent2)
     ]
 
     encoding = self.tokenizer(cloze_style_sents, return_tensors='pt', padding=True, truncation=True,
-                             max_length=512)  # Ensure we use enough context
+                             max_length=192)  # Balanced sequence length
 
     token_ids = torch.LongTensor(encoding['input_ids'])
     attention_mask = torch.LongTensor(encoding['attention_mask'])
