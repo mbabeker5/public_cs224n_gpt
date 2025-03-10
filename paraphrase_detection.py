@@ -55,7 +55,6 @@ class ParaphraseGPT(nn.Module):
     
     # By default, fine-tune the full model.
     # Instead of a 2-class output, we'll directly predict the token IDs for "yes" (8505) and "no" (3919)
-    # We'll use the vocabulary size of GPT-2 for the output dimension
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     
     # Map class indices to token IDs
@@ -63,6 +62,15 @@ class ParaphraseGPT(nn.Module):
         0: 3919,  # "no" token ID
         1: 8505   # "yes" token ID
     }
+    
+    # Add a classification head for better performance
+    # Use args.d instead of config.n_embd since we're using a custom GPT2 implementation
+    self.hidden_size = args.d
+    self.classifier = nn.Sequential(
+        nn.Linear(self.hidden_size, self.hidden_size),
+        nn.Tanh(),
+        nn.Linear(self.hidden_size, 2)
+    )
     
     # We'll freeze most of the model by default to speed up training
     self.freeze_most_layers(args.num_trainable_layers)
@@ -117,18 +125,10 @@ class ParaphraseGPT(nn.Module):
     last_token_hidden_states = torch.stack([last_hidden_state[i, idx, :] 
                                            for i, idx in enumerate(last_token_indices)])
     
-    # Project to the full vocabulary space using the GPT-2 word embedding matrix
-    logits = F.linear(last_token_hidden_states, self.gpt.word_embedding.weight)
+    # Use our classifier to get better predictions
+    logits = self.classifier(last_token_hidden_states)
     
-    # Extract only the logits for "yes" (8505) and "no" (3919) tokens
-    # This creates a tensor of shape [batch_size, 2] where the first column is the logit for "no"
-    # and the second column is the logit for "yes"
-    binary_logits = torch.stack([
-        logits[:, self.class_token_ids[0]],  # "no" logits
-        logits[:, self.class_token_ids[1]]   # "yes" logits
-    ], dim=1)
-    
-    return binary_logits
+    return logits
 
 
 
@@ -172,6 +172,19 @@ def train(args):
 
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+  
+  # Add a learning rate scheduler for better convergence
+  total_steps = len(para_train_dataloader) * args.epochs
+  warmup_steps = int(0.1 * total_steps)  # 10% of total steps for warmup
+  
+  # Use a simpler learning rate scheduler for compatibility
+  scheduler = torch.optim.lr_scheduler.LinearLR(
+      optimizer,
+      start_factor=0.1,
+      end_factor=1.0,
+      total_iters=warmup_steps
+  )
+  
   best_dev_acc = 0
 
   # Run for the specified number of epochs.
@@ -189,7 +202,8 @@ def train(args):
       # Compute the loss, gradients, and update the model's parameters.
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
-      preds = torch.argmax(logits, dim=1)
+      
+      # Apply cross entropy loss without label smoothing to ensure compatibility
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       
@@ -197,6 +211,7 @@ def train(args):
       torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
       
       optimizer.step()
+      scheduler.step()  # Update learning rate
 
       train_loss += loss.item()
       num_batches += 1
@@ -263,11 +278,11 @@ def get_args():
   parser.add_argument("--para_test_out", type=str, default="predictions/para-test-output.csv")
 
   parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=10)
+  parser.add_argument("--epochs", type=int, help="Number of epochs to train", default=5)
   parser.add_argument("--use_gpu", action='store_true')
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=64)
-  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--lr", type=float, help="Learning rate", default=5e-5)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
@@ -275,10 +290,10 @@ def get_args():
   # Add parameter to control how many layers to train
   parser.add_argument("--num_trainable_layers", type=int, 
                       help="Number of transformer layers to train (counting from the end). Set to 0 to train only the output layer, or -1 to train all layers.",
-                      default=3)
+                      default=4)
   
   # Add parameter for weight decay to prevent overfitting
-  parser.add_argument("--weight_decay", type=float, help="Weight decay for AdamW", default=0.01)
+  parser.add_argument("--weight_decay", type=float, help="Weight decay for AdamW", default=0.05)
   
   # Add parameter for gradient clipping
   parser.add_argument("--max_grad_norm", type=float, help="Maximum gradient norm for clipping", default=1.0)
