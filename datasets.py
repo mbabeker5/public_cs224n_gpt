@@ -16,12 +16,16 @@ from transformers import GPT2Tokenizer
 
 
 def preprocess_string(s):
-  return ' '.join(s.lower()
-                  .replace('.', ' .')
-                  .replace('?', ' ?')
-                  .replace(',', ' ,')
-                  .replace('\'', ' \'')
-                  .split())
+  # Clean and normalize the text for better performance
+  s = s.lower()
+  s = re.sub(r'\s+', ' ', s)  # Replace multiple spaces with a single space
+  s = re.sub(r'[^\w\s\?\.\,\']', ' ', s)  # Keep only alphanumeric, spaces, and some punctuation
+  s = ' '.join(s.split())  # Normalize spaces
+  s = s.replace('.', ' . ')
+  s = s.replace('?', ' ? ')
+  s = s.replace(',', ' , ')
+  s = s.replace('\'', ' \' ')
+  return s.strip()
 
 
 class ParaphraseDetectionDataset(Dataset):
@@ -44,9 +48,9 @@ class ParaphraseDetectionDataset(Dataset):
     labels = torch.LongTensor([x[2] for x in all_data])
     sent_ids = [x[3] for x in all_data]
 
-    # Balanced prompt format - informative but memory-efficient
+    # Enhanced prompt format for better performance
     cloze_style_sents = [
-        f'Question 1: "{s1}"\nQuestion 2: "{s2}"\nAre these questions paraphrases? '
+        f'Determine if these questions are paraphrases:\nQuestion 1: "{s1}"\nQuestion 2: "{s2}"\nAre these questions asking the same thing in different words? '
         for (s1, s2) in zip(sent1, sent2)
     ]
     
@@ -84,9 +88,9 @@ class ParaphraseDetectionTestDataset(Dataset):
     sent2 = [x[1] for x in all_data]
     sent_ids = [x[2] for x in all_data]
 
-    # Balanced prompt format - informative but memory-efficient
+    # Enhanced prompt format for better performance
     cloze_style_sents = [
-        f'Question 1: "{s1}"\nQuestion 2: "{s2}"\nAre these questions paraphrases? '
+        f'Determine if these questions are paraphrases:\nQuestion 1: "{s1}"\nQuestion 2: "{s2}"\nAre these questions asking the same thing in different words? '
         for (s1, s2) in zip(sent1, sent2)
     ]
 
@@ -111,18 +115,20 @@ def load_paraphrase_data(paraphrase_filename, split='train'):
     with open(paraphrase_filename, 'r', encoding='utf-8') as fp:
       for record in csv.DictReader(fp, delimiter='\t'):
         sent_id = record['id'].lower().strip()
-        paraphrase_data.append((preprocess_string(record['sentence1']),
-                                preprocess_string(record['sentence2']),
-                                sent_id))
+        # Apply preprocessing to improve data quality
+        sent1 = preprocess_string(record['sentence1'])
+        sent2 = preprocess_string(record['sentence2'])
+        paraphrase_data.append((sent1, sent2, sent_id))
 
   else:
     with open(paraphrase_filename, 'r', encoding='utf-8') as fp:
       for record in csv.DictReader(fp, delimiter='\t'):
         try:
           sent_id = record['id'].lower().strip()
-          paraphrase_data.append((preprocess_string(record['sentence1']),
-                                  preprocess_string(record['sentence2']),
-                                  int(float(record['is_duplicate'])), sent_id))
+          # Apply preprocessing to improve data quality
+          sent1 = preprocess_string(record['sentence1'])
+          sent2 = preprocess_string(record['sentence2'])
+          paraphrase_data.append((sent1, sent2, int(float(record['is_duplicate'])), sent_id))
         except:
           pass
 

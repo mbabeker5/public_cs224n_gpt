@@ -67,12 +67,15 @@ class ParaphraseGPT(nn.Module):
     # Use args.d instead of config.n_embd since we're using a custom GPT2 implementation
     self.hidden_size = args.d
     
-    # Balanced architecture - not too complex but still powerful enough
+    # Enhanced classification head with better architecture for paraphrase detection
     self.classifier = nn.Sequential(
+        nn.LayerNorm(self.hidden_size),
         nn.Dropout(0.1),
-        nn.Linear(self.hidden_size, self.hidden_size // 2),
+        nn.Linear(self.hidden_size, self.hidden_size),
         nn.GELU(),
-        nn.Linear(self.hidden_size // 2, 2)
+        nn.LayerNorm(self.hidden_size),
+        nn.Dropout(0.2),
+        nn.Linear(self.hidden_size, 2)
     )
     
     # We'll freeze most of the model by default to speed up training
@@ -128,8 +131,17 @@ class ParaphraseGPT(nn.Module):
     last_token_hidden_states = torch.stack([last_hidden_state[i, idx, :] 
                                            for i, idx in enumerate(last_token_indices)])
     
-    # Use our balanced classifier to get predictions
-    logits = self.classifier(last_token_hidden_states)
+    # Also get a weighted representation of the entire sequence
+    # This helps capture more context from the entire input
+    seq_lengths = attention_mask.sum(dim=1).unsqueeze(-1)  # [batch_size, 1]
+    # Get mean of all non-padding tokens
+    mean_pooled = (last_hidden_state * attention_mask.unsqueeze(-1)).sum(dim=1) / seq_lengths
+    
+    # Combine the last token representation with the mean pooled representation
+    combined_representation = last_token_hidden_states + 0.2 * mean_pooled
+    
+    # Use our enhanced classifier to get predictions
+    logits = self.classifier(combined_representation)
     
     return logits
 
@@ -180,12 +192,12 @@ def train(args):
   total_steps = len(para_train_dataloader) * args.epochs // args.gradient_accumulation_steps
   warmup_steps = int(0.1 * total_steps)  # 10% of total steps for warmup
   
-  # Use a simpler learning rate scheduler for compatibility
-  scheduler = torch.optim.lr_scheduler.LinearLR(
+  # Use a better learning rate scheduler for improved performance
+  from transformers import get_linear_schedule_with_warmup
+  scheduler = get_linear_schedule_with_warmup(
       optimizer,
-      start_factor=0.1,
-      end_factor=1.0,
-      total_iters=warmup_steps
+      num_warmup_steps=warmup_steps,
+      num_training_steps=total_steps
   )
   
   best_dev_acc = 0
@@ -218,6 +230,9 @@ def train(args):
       loss = loss / args.gradient_accumulation_steps
       loss.backward()
       
+      # Store loss value before potentially deleting the tensor
+      loss_item = loss.item()
+      
       # Update weights only after accumulating enough gradients
       if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(para_train_dataloader):
         # Apply gradient clipping
@@ -238,7 +253,7 @@ def train(args):
           del b_ids, b_mask, labels, logits, loss
           torch.cuda.empty_cache()
 
-      train_loss += loss.item() * args.gradient_accumulation_steps  # Adjust for scaling
+      train_loss += loss_item * args.gradient_accumulation_steps  # Adjust for scaling
       num_batches += 1
 
     train_loss = train_loss / num_batches
@@ -311,17 +326,17 @@ def get_args():
   parser.add_argument("--para_test_out", type=str, default="predictions/para-test-output.csv")
 
   parser.add_argument("--seed", type=int, default=42)
-  parser.add_argument("--epochs", type=int, help="Number of epochs to train", default=6)
+  parser.add_argument("--epochs", type=int, help="Number of epochs to train", default=8)
   parser.add_argument("--use_gpu", action='store_true')
 
-  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=64)
-  parser.add_argument("--lr", type=float, help="Learning rate", default=2e-5)
+  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=16)
+  parser.add_argument("--lr", type=float, help="Learning rate", default=5e-5)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
   
   # Add parameter for gradient accumulation
-  parser.add_argument("--gradient_accumulation_steps", type=int, help="Number of steps to accumulate gradients", default=8)
+  parser.add_argument("--gradient_accumulation_steps", type=int, help="Number of steps to accumulate gradients", default=4)
   
   # Add parameter to control how many layers to train
   parser.add_argument("--num_trainable_layers", type=int, 

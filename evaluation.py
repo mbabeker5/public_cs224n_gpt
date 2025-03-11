@@ -38,7 +38,7 @@ def model_eval_paraphrase(dataloader, model, device):
     sent_ids.extend(b_sent_ids)
     
     # Free up memory
-    del b_ids, b_mask, logits
+    del b_ids, b_mask
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -65,7 +65,7 @@ def model_test_paraphrase(dataloader, model, device):
     sent_ids.extend(b_sent_ids)
     
     # Free up memory
-    del b_ids, b_mask, logits
+    del b_ids, b_mask
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
