@@ -67,14 +67,13 @@ class ParaphraseGPT(nn.Module):
     # Use args.d instead of config.n_embd since we're using a custom GPT2 implementation
     self.hidden_size = args.d
     
-    # Enhanced classification head with better architecture for paraphrase detection
+    # Advanced classification head with residual connections and layer normalization
     self.classifier = nn.Sequential(
         nn.LayerNorm(self.hidden_size),
         nn.Dropout(0.1),
-        nn.Linear(self.hidden_size, self.hidden_size),
-        nn.GELU(),
+        ResidualBlock(self.hidden_size),
         nn.LayerNorm(self.hidden_size),
-        nn.Dropout(0.2),
+        nn.Dropout(0.1),
         nn.Linear(self.hidden_size, 2)
     )
     
@@ -131,14 +130,25 @@ class ParaphraseGPT(nn.Module):
     last_token_hidden_states = torch.stack([last_hidden_state[i, idx, :] 
                                            for i, idx in enumerate(last_token_indices)])
     
-    # Also get a weighted representation of the entire sequence
-    # This helps capture more context from the entire input
-    seq_lengths = attention_mask.sum(dim=1).unsqueeze(-1)  # [batch_size, 1]
-    # Get mean of all non-padding tokens
-    mean_pooled = (last_hidden_state * attention_mask.unsqueeze(-1)).sum(dim=1) / seq_lengths
+    # Advanced attention pooling
+    # Create a learnable attention vector (implicitly through the linear layer)
+    # that attends to different parts of the sequence
+    attention_scores = torch.matmul(
+        last_hidden_state, 
+        last_token_hidden_states.unsqueeze(2)
+    ).squeeze(2)
     
-    # Combine the last token representation with the mean pooled representation
-    combined_representation = last_token_hidden_states + 0.2 * mean_pooled
+    # Apply mask to ignore padding tokens
+    attention_scores = attention_scores.masked_fill(attention_mask == 0, -1e9)
+    
+    # Apply softmax to get attention weights
+    attention_weights = torch.softmax(attention_scores, dim=1).unsqueeze(2)
+    
+    # Apply attention weights to get context vector
+    context_vector = torch.sum(last_hidden_state * attention_weights, dim=1)
+    
+    # Combine the last token representation with the context vector
+    combined_representation = last_token_hidden_states + 0.5 * context_vector
     
     # Use our enhanced classifier to get predictions
     logits = self.classifier(combined_representation)
@@ -326,25 +336,25 @@ def get_args():
   parser.add_argument("--para_test_out", type=str, default="predictions/para-test-output.csv")
 
   parser.add_argument("--seed", type=int, default=42)
-  parser.add_argument("--epochs", type=int, help="Number of epochs to train", default=8)
+  parser.add_argument("--epochs", type=int, help="Number of epochs to train", default=6)
   parser.add_argument("--use_gpu", action='store_true')
 
-  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=16)
-  parser.add_argument("--lr", type=float, help="Learning rate", default=5e-5)
+  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
+  parser.add_argument("--lr", type=float, help="Learning rate", default=2e-5)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
-                      choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
+                      choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2-medium')
   
   # Add parameter for gradient accumulation
-  parser.add_argument("--gradient_accumulation_steps", type=int, help="Number of steps to accumulate gradients", default=4)
+  parser.add_argument("--gradient_accumulation_steps", type=int, help="Number of steps to accumulate gradients", default=8)
   
   # Add parameter to control how many layers to train
   parser.add_argument("--num_trainable_layers", type=int, 
                       help="Number of transformer layers to train (counting from the end). Set to 0 to train only the output layer, or -1 to train all layers.",
-                      default=6)
+                      default=8)
   
   # Add parameter for weight decay to prevent overfitting
-  parser.add_argument("--weight_decay", type=float, help="Weight decay for AdamW", default=0.01)
+  parser.add_argument("--weight_decay", type=float, help="Weight decay for AdamW", default=0.02)
   
   # Add parameter for gradient clipping
   parser.add_argument("--max_grad_norm", type=float, help="Maximum gradient norm for clipping", default=1.0)
@@ -370,6 +380,22 @@ def add_arguments(args):
   else:
     raise Exception(f'{args.model_size} is not supported.')
   return args
+
+
+# Residual block for better gradient flow
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.linear1 = nn.Linear(hidden_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.activation = nn.GELU()
+        
+    def forward(self, x):
+        residual = x
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.linear2(x)
+        return x + residual
 
 
 if __name__ == "__main__":

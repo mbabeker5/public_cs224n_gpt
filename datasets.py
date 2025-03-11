@@ -48,14 +48,18 @@ class ParaphraseDetectionDataset(Dataset):
     labels = torch.LongTensor([x[2] for x in all_data])
     sent_ids = [x[3] for x in all_data]
 
-    # Enhanced prompt format for better performance
+    # Advanced prompt format with explicit instructions
     cloze_style_sents = [
-        f'Determine if these questions are paraphrases:\nQuestion 1: "{s1}"\nQuestion 2: "{s2}"\nAre these questions asking the same thing in different words? '
+        f'Task: Determine if two questions are paraphrases (same meaning, different words).\n'
+        f'Question 1: "{s1}"\n'
+        f'Question 2: "{s2}"\n'
+        f'Analysis: Compare the core meaning of both questions.\n'
+        f'Are these questions paraphrases of each other? '
         for (s1, s2) in zip(sent1, sent2)
     ]
     
     encoding = self.tokenizer(cloze_style_sents, return_tensors='pt', padding=True, truncation=True, 
-                             max_length=192)  # Balanced sequence length
+                             max_length=256)  # Increased max length for better context
 
     token_ids = torch.LongTensor(encoding['input_ids'])
     attention_mask = torch.LongTensor(encoding['attention_mask'])
@@ -88,14 +92,18 @@ class ParaphraseDetectionTestDataset(Dataset):
     sent2 = [x[1] for x in all_data]
     sent_ids = [x[2] for x in all_data]
 
-    # Enhanced prompt format for better performance
+    # Advanced prompt format with explicit instructions
     cloze_style_sents = [
-        f'Determine if these questions are paraphrases:\nQuestion 1: "{s1}"\nQuestion 2: "{s2}"\nAre these questions asking the same thing in different words? '
+        f'Task: Determine if two questions are paraphrases (same meaning, different words).\n'
+        f'Question 1: "{s1}"\n'
+        f'Question 2: "{s2}"\n'
+        f'Analysis: Compare the core meaning of both questions.\n'
+        f'Are these questions paraphrases of each other? '
         for (s1, s2) in zip(sent1, sent2)
     ]
 
     encoding = self.tokenizer(cloze_style_sents, return_tensors='pt', padding=True, truncation=True,
-                             max_length=192)  # Balanced sequence length
+                             max_length=256)  # Increased max length for better context
 
     token_ids = torch.LongTensor(encoding['input_ids'])
     attention_mask = torch.LongTensor(encoding['attention_mask'])
@@ -128,7 +136,17 @@ def load_paraphrase_data(paraphrase_filename, split='train'):
           # Apply preprocessing to improve data quality
           sent1 = preprocess_string(record['sentence1'])
           sent2 = preprocess_string(record['sentence2'])
-          paraphrase_data.append((sent1, sent2, int(float(record['is_duplicate'])), sent_id))
+          is_duplicate = int(float(record['is_duplicate']))
+          
+          # Add the original pair
+          paraphrase_data.append((sent1, sent2, is_duplicate, sent_id))
+          
+          # Data augmentation: Add the reversed pair if this is the training set
+          # This helps the model learn that order doesn't matter for paraphrasing
+          if split == 'train':
+            # Create a new ID for the reversed pair
+            reversed_id = f"{sent_id}_rev"
+            paraphrase_data.append((sent2, sent1, is_duplicate, reversed_id))
         except:
           pass
 
