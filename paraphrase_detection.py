@@ -15,6 +15,7 @@ import argparse
 import random
 import torch
 import gc
+import os
 
 import numpy as np
 import torch.nn.functional as F
@@ -26,7 +27,8 @@ from tqdm import tqdm
 from datasets import (
   ParaphraseDetectionDataset,
   ParaphraseDetectionTestDataset,
-  load_paraphrase_data
+  load_paraphrase_data,
+  generate_losing_samples
 )
 from evaluation import model_eval_paraphrase, model_test_paraphrase
 from models.gpt2 import GPT2Model
@@ -171,20 +173,110 @@ def save_model(model, optimizer, args, filepath):
   print(f"save the model to {filepath}")
 
 
+def dpo_loss(model, winning_batch, losing_batch, beta=0.1, device="cuda"):
+  """
+  Compute the DPO loss for a batch of winning and losing samples.
+  
+  Args:
+      model: The model to train
+      winning_batch: Batch of winning samples
+      losing_batch: Batch of losing samples
+      beta: Temperature parameter for the DPO loss
+      device: The device to run the model on
+      
+  Returns:
+      DPO loss
+  """
+  # Get model outputs for winning samples
+  winning_ids = winning_batch['token_ids'].to(device)
+  winning_mask = winning_batch['attention_mask'].to(device)
+  winning_logits = model(winning_ids, winning_mask)
+  winning_labels = winning_batch['labels'].to(device)
+  
+  # Get model outputs for losing samples
+  losing_ids = losing_batch['token_ids'].to(device)
+  losing_mask = losing_batch['attention_mask'].to(device)
+  losing_logits = model(losing_ids, losing_mask)
+  losing_labels = losing_batch['labels'].to(device)
+  
+  # Compute log probabilities for the correct labels
+  winning_log_probs = F.log_softmax(winning_logits, dim=1)
+  losing_log_probs = F.log_softmax(losing_logits, dim=1)
+  
+  # Extract log probs for the true labels
+  winning_log_probs = torch.gather(winning_log_probs, 1, winning_labels.unsqueeze(1)).squeeze(1)
+  losing_log_probs = torch.gather(losing_log_probs, 1, losing_labels.unsqueeze(1)).squeeze(1)
+  
+  # Compute the DPO loss
+  log_ratio = winning_log_probs - losing_log_probs
+  loss = -torch.mean(torch.log(torch.sigmoid(beta * log_ratio)))
+  
+  return loss
+
+
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  
+  # Create output directory for DPO data if needed
+  if args.use_dpo:
+    os.makedirs('dpo_data', exist_ok=True)
+  
   # Create the data and its corresponding datasets and dataloader.
   para_train_data = load_paraphrase_data(args.para_train)
   para_dev_data = load_paraphrase_data(args.para_dev)
 
-  para_train_data = ParaphraseDetectionDataset(para_train_data, args)
+  # If using DPO, generate losing samples
+  if args.use_dpo:
+    losing_samples_path = f'dpo_data/losing_samples_{args.dpo_strategy}.pt'
+    if os.path.exists(losing_samples_path) and not args.regenerate_losing_samples:
+      print(f"Loading losing samples from {losing_samples_path}")
+      losing_samples = torch.load(losing_samples_path)
+    else:
+      print(f"Generating losing samples using strategy: {args.dpo_strategy}")
+      tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+      # Initialize a temporary model for generating samples
+      temp_args = add_arguments(args)
+      temp_model = ParaphraseGPT(temp_args)
+      temp_model = temp_model.to(device)
+      
+      losing_samples = generate_losing_samples(
+          temp_model, 
+          tokenizer, 
+          para_train_data, 
+          device, 
+          strategy=args.dpo_strategy
+      )
+      torch.save(losing_samples, losing_samples_path)
+      print(f"Saved losing samples to {losing_samples_path}")
+      
+      # Clean up temporary model
+      del temp_model
+      if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+  para_train_data_dataset = ParaphraseDetectionDataset(para_train_data, args)
   para_dev_data = ParaphraseDetectionDataset(para_dev_data, args)
 
-  para_train_dataloader = DataLoader(para_train_data, shuffle=True, batch_size=args.batch_size,
-                                     collate_fn=para_train_data.collate_fn)
+  # If using DPO, create paired dataset
+  if args.use_dpo:
+    para_train_dataloader = DataLoader(
+      para_train_data_dataset, 
+      shuffle=True, 
+      batch_size=args.batch_size,
+      collate_fn=lambda batch: para_train_data_dataset.collate_fn_dpo(batch, losing_samples)
+    )
+  else:
+    para_train_dataloader = DataLoader(
+      para_train_data_dataset, 
+      shuffle=True, 
+      batch_size=args.batch_size,
+      collate_fn=para_train_data_dataset.collate_fn
+    )
+    
   para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
-                                   collate_fn=para_dev_data.collate_fn)
+                                 collate_fn=para_dev_data.collate_fn)
 
   args = add_arguments(args)
   model = ParaphraseGPT(args)
@@ -225,17 +317,28 @@ def train(args):
         gc.collect()
     
     for batch_idx, batch in enumerate(tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE)):
-      # Get the input and move it to the gpu (I do not recommend training this model on CPU).
-      b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
-      b_ids = b_ids.to(device)
-      b_mask = b_mask.to(device)
-      labels = labels.to(device)
+      # Different processing depending on whether we're using DPO
+      if args.use_dpo:
+        # Get winning and losing batches
+        winning_batch = batch['winning']
+        losing_batch = batch['losing']
+        
+        # Compute DPO loss
+        loss = dpo_loss(model, winning_batch, losing_batch, beta=args.dpo_beta, device=device)
+      else:
+        # Standard training
+        # Get the input and move it to the gpu (I do not recommend training this model on CPU).
+        b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
+        b_ids = b_ids.to(device)
+        b_mask = b_mask.to(device)
+        labels = labels.to(device)
 
-      # Compute the loss, gradients, and update the model's parameters.
-      logits = model(b_ids, b_mask)
+        # Compute the loss, gradients, and update the model's parameters.
+        logits = model(b_ids, b_mask)
+        
+        # Apply cross entropy loss without label smoothing to ensure compatibility
+        loss = F.cross_entropy(logits, labels, reduction='mean')
       
-      # Apply cross entropy loss without label smoothing to ensure compatibility
-      loss = F.cross_entropy(logits, labels, reduction='mean')
       # Scale the loss by gradient accumulation steps
       loss = loss / args.gradient_accumulation_steps
       loss.backward()
@@ -260,7 +363,10 @@ def train(args):
       
       # Delete tensors to free up memory only if we're close to OOM
       if batch_idx % 500 == 0 and torch.cuda.is_available():
-          del b_ids, b_mask, labels, logits, loss
+          if args.use_dpo:
+              del winning_batch, losing_batch, loss
+          else:
+              del b_ids, b_mask, labels, logits, loss
           torch.cuda.empty_cache()
 
       train_loss += loss_item * args.gradient_accumulation_steps  # Adjust for scaling
@@ -343,7 +449,7 @@ def get_args():
   parser.add_argument("--lr", type=float, help="Learning rate", default=2e-5)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
-                      choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2-medium')
+                      choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
   
   # Add parameter for gradient accumulation
   parser.add_argument("--gradient_accumulation_steps", type=int, help="Number of steps to accumulate gradients", default=8)
@@ -358,6 +464,15 @@ def get_args():
   
   # Add parameter for gradient clipping
   parser.add_argument("--max_grad_norm", type=float, help="Maximum gradient norm for clipping", default=1.0)
+  
+  # DPO-specific parameters
+  parser.add_argument("--use_dpo", action='store_true', help="Use Direct Preference Optimization")
+  parser.add_argument("--dpo_strategy", type=str, choices=["heuristic", "model_based"], default="heuristic",
+                     help="Strategy for generating losing samples")
+  parser.add_argument("--dpo_beta", type=float, default=0.1, 
+                     help="Temperature parameter for DPO loss")
+  parser.add_argument("--regenerate_losing_samples", action='store_true',
+                     help="Regenerate losing samples even if they exist in cache")
 
   args = parser.parse_args()
   return args
