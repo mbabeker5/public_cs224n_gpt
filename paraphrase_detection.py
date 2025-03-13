@@ -173,7 +173,7 @@ def save_model(model, optimizer, args, filepath):
   print(f"save the model to {filepath}")
 
 
-def dpo_loss(model, winning_batch, losing_batch, beta=0.1, device="cuda"):
+def dpo_loss(model, winning_batch, losing_batch, beta=0.1, device="cuda", alpha=0.5):
   """
   Compute the DPO loss for a batch of winning and losing samples.
   
@@ -183,6 +183,7 @@ def dpo_loss(model, winning_batch, losing_batch, beta=0.1, device="cuda"):
       losing_batch: Batch of losing samples
       beta: Temperature parameter for the DPO loss
       device: The device to run the model on
+      alpha: Weight for mixing DPO loss with standard CE loss
       
   Returns:
       DPO loss
@@ -199,6 +200,9 @@ def dpo_loss(model, winning_batch, losing_batch, beta=0.1, device="cuda"):
   losing_logits = model(losing_ids, losing_mask)
   losing_labels = losing_batch['labels'].to(device)
   
+  # Compute standard cross-entropy loss for winning samples
+  ce_loss = F.cross_entropy(winning_logits, winning_labels, reduction='mean')
+  
   # Compute log probabilities for the correct labels
   winning_log_probs = F.log_softmax(winning_logits, dim=1)
   losing_log_probs = F.log_softmax(losing_logits, dim=1)
@@ -207,11 +211,13 @@ def dpo_loss(model, winning_batch, losing_batch, beta=0.1, device="cuda"):
   winning_log_probs = torch.gather(winning_log_probs, 1, winning_labels.unsqueeze(1)).squeeze(1)
   losing_log_probs = torch.gather(losing_log_probs, 1, losing_labels.unsqueeze(1)).squeeze(1)
   
-  # Compute the DPO loss
+  # Compute the DPO loss with margin
   log_ratio = winning_log_probs - losing_log_probs
-  loss = -torch.mean(torch.log(torch.sigmoid(beta * log_ratio)))
+  dpo_component = -torch.mean(torch.log(torch.sigmoid(beta * log_ratio)))
   
-  return loss
+  # Mix standard CE loss with DPO loss for more stable training
+  # Start with more CE loss and gradually increase DPO component
+  return alpha * ce_loss + (1 - alpha) * dpo_component
 
 
 def train(args):
@@ -221,10 +227,111 @@ def train(args):
   # Create output directory for DPO data if needed
   if args.use_dpo:
     os.makedirs('dpo_data', exist_ok=True)
+    os.makedirs('predictions', exist_ok=True)
   
   # Create the data and its corresponding datasets and dataloader.
   para_train_data = load_paraphrase_data(args.para_train)
   para_dev_data = load_paraphrase_data(args.para_dev)
+
+  # First train a standard model if we're using DPO
+  if args.use_dpo and args.pretrain_epochs > 0:
+    print(f"Pre-training a standard model for {args.pretrain_epochs} epochs before DPO...")
+    # Create standard dataset
+    para_train_dataset = ParaphraseDetectionDataset(para_train_data, args)
+    para_dev_dataset = ParaphraseDetectionDataset(para_dev_data, args)
+    
+    para_train_dataloader = DataLoader(
+      para_train_dataset, 
+      shuffle=True, 
+      batch_size=args.batch_size,
+      collate_fn=para_train_dataset.collate_fn
+    )
+    
+    para_dev_dataloader = DataLoader(
+      para_dev_dataset, 
+      shuffle=False, 
+      batch_size=args.batch_size,
+      collate_fn=para_dev_dataset.collate_fn
+    )
+    
+    # Initialize model
+    args_copy = add_arguments(args)
+    model = ParaphraseGPT(args_copy)
+    model = model.to(device)
+    
+    # Initialize optimizer and scheduler
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    total_steps = len(para_train_dataloader) * args.pretrain_epochs // args.gradient_accumulation_steps
+    warmup_steps = int(0.1 * total_steps)
+    
+    from transformers import get_linear_schedule_with_warmup
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
+    
+    best_dev_acc = 0
+    
+    # Pre-train for a few epochs
+    for epoch in range(args.pretrain_epochs):
+      model.train()
+      train_loss = 0
+      num_batches = 0
+      optimizer.zero_grad()
+      
+      if torch.cuda.is_available():
+          torch.cuda.empty_cache()
+          gc.collect()
+      
+      for batch_idx, batch in enumerate(tqdm(para_train_dataloader, desc=f'pretrain-{epoch}', disable=TQDM_DISABLE)):
+        b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
+        b_ids = b_ids.to(device)
+        b_mask = b_mask.to(device)
+        labels = labels.to(device)
+
+        logits = model(b_ids, b_mask)
+        loss = F.cross_entropy(logits, labels, reduction='mean')
+        loss = loss / args.gradient_accumulation_steps
+        loss.backward()
+        
+        loss_item = loss.item()
+        
+        if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(para_train_dataloader):
+          torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+          optimizer.step()
+          scheduler.step()
+          optimizer.zero_grad()
+        
+        if batch_idx % 100 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        if batch_idx % 500 == 0 and torch.cuda.is_available():
+            del b_ids, b_mask, labels, logits, loss
+            torch.cuda.empty_cache()
+
+        train_loss += loss_item * args.gradient_accumulation_steps
+        num_batches += 1
+
+      train_loss = train_loss / num_batches
+      dev_acc, dev_f1, _, _, _ = model_eval_paraphrase(para_dev_dataloader, model, device)
+
+      if dev_acc > best_dev_acc:
+        best_dev_acc = dev_acc
+        pretrain_path = f'pretrain-{args.pretrain_epochs}epochs-{args.lr}-para.pt'
+        save_model(model, optimizer, args, pretrain_path)
+
+      print(f"Pretrain Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}, dev f1 :: {dev_f1 :.3f}")
+    
+    # Load the best pretrained model for DPO fine-tuning
+    if best_dev_acc > 0:
+      print(f"Loading best pretrained model with dev acc {best_dev_acc:.3f}")
+      saved = torch.load(pretrain_path)
+      model.load_state_dict(saved['model'])
+    
+    print("Starting DPO fine-tuning...")
 
   # If using DPO, generate losing samples
   if args.use_dpo:
@@ -235,13 +342,19 @@ def train(args):
     else:
       print(f"Generating losing samples using strategy: {args.dpo_strategy}")
       tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-      # Initialize a temporary model for generating samples
-      temp_args = add_arguments(args)
-      temp_model = ParaphraseGPT(temp_args)
-      temp_model = temp_model.to(device)
+      
+      # If we haven't pretrained, initialize a model for generating samples
+      if not args.pretrain_epochs > 0 or not 'model' in locals():
+        temp_args = add_arguments(args)
+        temp_model = ParaphraseGPT(temp_args)
+        temp_model = temp_model.to(device)
+        model_for_samples = temp_model
+      else:
+        # Use the pretrained model for better sample generation
+        model_for_samples = model
       
       losing_samples = generate_losing_samples(
-          temp_model, 
+          model_for_samples, 
           tokenizer, 
           para_train_data, 
           device, 
@@ -250,37 +363,41 @@ def train(args):
       torch.save(losing_samples, losing_samples_path)
       print(f"Saved losing samples to {losing_samples_path}")
       
-      # Clean up temporary model
-      del temp_model
-      if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        gc.collect()
+      # Clean up temporary model if we created one
+      if not args.pretrain_epochs > 0 or not 'model' in locals():
+        del temp_model
+        if torch.cuda.is_available():
+          torch.cuda.empty_cache()
+          gc.collect()
 
-  para_train_data_dataset = ParaphraseDetectionDataset(para_train_data, args)
-  para_dev_data = ParaphraseDetectionDataset(para_dev_data, args)
+  # Create datasets
+  para_train_dataset = ParaphraseDetectionDataset(para_train_data, args)
+  para_dev_dataset = ParaphraseDetectionDataset(para_dev_data, args)
 
   # If using DPO, create paired dataset
   if args.use_dpo:
     para_train_dataloader = DataLoader(
-      para_train_data_dataset, 
+      para_train_dataset, 
       shuffle=True, 
       batch_size=args.batch_size,
-      collate_fn=lambda batch: para_train_data_dataset.collate_fn_dpo(batch, losing_samples)
+      collate_fn=lambda batch: para_train_dataset.collate_fn_dpo(batch, losing_samples)
     )
   else:
     para_train_dataloader = DataLoader(
-      para_train_data_dataset, 
+      para_train_dataset, 
       shuffle=True, 
       batch_size=args.batch_size,
-      collate_fn=para_train_data_dataset.collate_fn
+      collate_fn=para_train_dataset.collate_fn
     )
     
-  para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
-                                 collate_fn=para_dev_data.collate_fn)
+  para_dev_dataloader = DataLoader(para_dev_dataset, shuffle=False, batch_size=args.batch_size,
+                                 collate_fn=para_dev_dataset.collate_fn)
 
-  args = add_arguments(args)
-  model = ParaphraseGPT(args)
-  model = model.to(device)
+  # Initialize model if we haven't already from pretraining
+  if not args.use_dpo or not args.pretrain_epochs > 0 or not 'model' in locals():
+    args = add_arguments(args)
+    model = ParaphraseGPT(args)
+    model = model.to(device)
 
   # Print the number of trainable parameters
   trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -316,6 +433,13 @@ def train(args):
         torch.cuda.empty_cache()
         gc.collect()
     
+    # Calculate alpha for DPO loss mixing (curriculum learning)
+    # Start with more CE loss and gradually increase DPO component
+    if args.use_dpo:
+      alpha = max(0.1, 1.0 - (epoch / args.epochs))
+    else:
+      alpha = 0.5  # Not used for standard training
+    
     for batch_idx, batch in enumerate(tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE)):
       # Different processing depending on whether we're using DPO
       if args.use_dpo:
@@ -323,8 +447,8 @@ def train(args):
         winning_batch = batch['winning']
         losing_batch = batch['losing']
         
-        # Compute DPO loss
-        loss = dpo_loss(model, winning_batch, losing_batch, beta=args.dpo_beta, device=device)
+        # Compute DPO loss with curriculum learning
+        loss = dpo_loss(model, winning_batch, losing_batch, beta=args.dpo_beta, device=device, alpha=alpha)
       else:
         # Standard training
         # Get the input and move it to the gpu (I do not recommend training this model on CPU).
@@ -473,6 +597,8 @@ def get_args():
                      help="Temperature parameter for DPO loss")
   parser.add_argument("--regenerate_losing_samples", action='store_true',
                      help="Regenerate losing samples even if they exist in cache")
+  parser.add_argument("--pretrain_epochs", type=int, default=2,
+                     help="Number of epochs to pretrain before DPO (0 to skip pretraining)")
 
   args = parser.parse_args()
   return args

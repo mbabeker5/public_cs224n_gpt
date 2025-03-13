@@ -247,18 +247,36 @@ def generate_losing_samples(model, tokenizer, train_data, device, strategy="heur
     losing_samples = {}
     
     if strategy == "heuristic":
-        # Heuristic strategy: Swap labels for non-paraphrases, modify sentences for paraphrases
+        # Heuristic strategy: Create challenging examples based on linguistic patterns
         for idx, (sent1, sent2, label, sent_id) in enumerate(train_data):
             if idx % 1000 == 0:
                 print(f"Processed {idx}/{len(train_data)} samples")
                 
             if label == 1:  # Paraphrase
-                # For paraphrases, modify one sentence to change meaning
-                modified_sent = modify_sentence(sent1)
+                # For paraphrases, create a non-paraphrase that's similar but changes meaning
+                # Use a mix of strategies for more diversity
+                if random.random() < 0.33:
+                    # Strategy 1: Modify key words to change meaning
+                    modified_sent = modify_key_words(sent1)
+                elif random.random() < 0.66:
+                    # Strategy 2: Add negation or change quantifiers
+                    modified_sent = add_negation_or_change_quantifiers(sent1)
+                else:
+                    # Strategy 3: Change the structure while preserving some words
+                    modified_sent = restructure_with_preserved_words(sent1)
+                
                 losing_samples[sent_id] = (modified_sent, sent2, 0, f"{sent_id}_losing")
             else:  # Non-paraphrase
-                # For non-paraphrases, just swap the label
-                losing_samples[sent_id] = (sent1, sent2, 1, f"{sent_id}_losing")
+                # For non-paraphrases, create a paraphrase-like example that's actually not a paraphrase
+                # This is more challenging than just swapping the label
+                if random.random() < 0.5:
+                    # Strategy 1: Make superficial changes that don't change meaning enough
+                    modified_sent = make_superficial_changes(sent1)
+                    losing_samples[sent_id] = (modified_sent, sent2, 1, f"{sent_id}_losing")
+                else:
+                    # Strategy 2: Create a sentence with similar words but different meaning
+                    modified_sent = create_similar_but_different(sent1)
+                    losing_samples[sent_id] = (modified_sent, sent2, 1, f"{sent_id}_losing")
     
     elif strategy == "model_based":
         # Model-based strategy: Use the model to find adversarial examples
@@ -297,136 +315,348 @@ def generate_losing_samples(model, tokenizer, train_data, device, strategy="heur
                     
                     # Get the probability of the correct label
                     correct_prob = probs[i, label].item()
+                    incorrect_prob = probs[i, 1-label].item()
                     
+                    # Create more challenging examples based on model confidence
                     if label == 1:  # Paraphrase
-                        # For paraphrases, modify one sentence to change meaning
-                        modified_sent = modify_sentence(sent1)
+                        if correct_prob > 0.9:  # High confidence
+                            # Create a very challenging example by preserving structure but changing meaning
+                            modified_sent = preserve_structure_change_meaning(sent1)
+                        else:  # Lower confidence
+                            # Create a moderately challenging example
+                            modified_sent = modify_key_words(sent1)
+                        
                         losing_samples[sent_id] = (modified_sent, sent2, 0, f"{sent_id}_losing")
                     else:  # Non-paraphrase
-                        # For non-paraphrases with high confidence, swap the label
-                        # For low confidence, find a more challenging example
-                        if correct_prob > 0.8:
-                            losing_samples[sent_id] = (sent1, sent2, 1, f"{sent_id}_losing")
+                        if incorrect_prob > 0.3:  # Model is somewhat confused
+                            # Create a very challenging example that looks like a paraphrase but isn't
+                            modified_sent = create_deceptive_paraphrase(sent1)
+                            losing_samples[sent_id] = (modified_sent, sent2, 1, f"{sent_id}_losing")
                         else:
-                            # Find a more challenging example by slightly modifying the sentences
-                            modified_sent = modify_sentence(sent1, subtle=True)
+                            # Create a moderately challenging example
+                            modified_sent = make_superficial_changes(sent1)
                             losing_samples[sent_id] = (modified_sent, sent2, 1, f"{sent_id}_losing")
     
     print(f"Generated {len(losing_samples)} losing samples")
     return losing_samples
 
-def modify_sentence(sentence, subtle=False):
-    """
-    Modify a sentence to change its meaning.
-    
-    Args:
-        sentence: The sentence to modify
-        subtle: Whether to make subtle changes (for more challenging examples)
-        
-    Returns:
-        Modified sentence
-    """
+def modify_key_words(sentence):
+    """Replace key words with antonyms or unrelated words to change meaning."""
     words = sentence.split()
     
     if len(words) < 3:
-        # For very short sentences, just add a negation
         return "not " + sentence
     
-    if subtle:
-        # Subtle modifications: change one word, add/remove a qualifier
-        modifications = [
-            # Change a random word
-            lambda s: replace_random_word(s),
-            # Add a qualifier
-            lambda s: add_qualifier(s),
-            # Remove a qualifier if present
-            lambda s: remove_qualifier(s)
-        ]
-    else:
-        # More significant modifications
-        modifications = [
-            # Add negation
-            lambda s: "not " + s,
-            # Change multiple words
-            lambda s: replace_multiple_words(s),
-            # Change the structure
-            lambda s: restructure_sentence(s)
-        ]
+    # Identify potential key words (nouns, verbs, adjectives)
+    # Simple heuristic: longer words are more likely to be content words
+    content_word_indices = [i for i, word in enumerate(words) 
+                           if len(word) > 3 and word.lower() not in ['this', 'that', 'with', 'from', 'have', 'what', 'when', 'where', 'which']]
     
-    # Choose a random modification
-    modification = random.choice(modifications)
-    return modification(sentence)
+    if not content_word_indices:
+        return "not " + sentence
+    
+    # Replace 1-2 key words
+    num_to_replace = min(len(content_word_indices), random.randint(1, 2))
+    indices_to_replace = random.sample(content_word_indices, num_to_replace)
+    
+    # Word replacements that change meaning
+    antonyms = {
+        'good': 'bad', 'bad': 'good', 'high': 'low', 'low': 'high',
+        'large': 'small', 'small': 'large', 'fast': 'slow', 'slow': 'fast',
+        'hot': 'cold', 'cold': 'hot', 'new': 'old', 'old': 'new',
+        'easy': 'difficult', 'difficult': 'easy', 'happy': 'sad', 'sad': 'happy',
+        'right': 'wrong', 'wrong': 'right', 'true': 'false', 'false': 'true',
+        'open': 'closed', 'closed': 'open', 'cheap': 'expensive', 'expensive': 'cheap',
+        'increase': 'decrease', 'decrease': 'increase', 'buy': 'sell', 'sell': 'buy',
+        'best': 'worst', 'worst': 'best', 'first': 'last', 'last': 'first',
+        'love': 'hate', 'hate': 'love', 'start': 'finish', 'finish': 'start',
+        'remember': 'forget', 'forget': 'remember', 'accept': 'reject', 'reject': 'accept'
+    }
+    
+    # Generic replacements for words not in the antonym dictionary
+    generic_replacements = ['different', 'opposite', 'unrelated', 'alternative', 
+                           'wrong', 'incorrect', 'better', 'worse', 'never', 'always',
+                           'rarely', 'frequently', 'unlikely', 'impossible', 'forbidden']
+    
+    for idx in indices_to_replace:
+        word = words[idx].lower()
+        if word in antonyms:
+            words[idx] = antonyms[word]
+        else:
+            words[idx] = random.choice(generic_replacements)
+    
+    return ' '.join(words)
 
-def replace_random_word(sentence):
-    """Replace a random content word in the sentence."""
+def add_negation_or_change_quantifiers(sentence):
+    """Add negation or change quantifiers to alter meaning."""
     words = sentence.split()
+    
+    # Strategies:
+    # 1. Add negation
+    # 2. Change quantifiers (all -> some, some -> none, etc.)
+    # 3. Add or remove modal verbs (can, must, should)
+    
+    strategy = random.choice(['negation', 'quantifier', 'modal'])
+    
+    if strategy == 'negation':
+        # Add negation at the beginning or before a verb
+        if random.random() < 0.5:
+            return "not " + sentence
+        else:
+            # Find a verb-like position to insert negation
+            for i in range(1, len(words)):
+                if len(words[i]) > 3 and words[i].lower() not in ['this', 'that', 'with', 'from']:
+                    words.insert(i, "not")
+                    break
+            else:
+                # If no suitable position found, add at beginning
+                words.insert(0, "not")
+    
+    elif strategy == 'quantifier':
+        # Replace or add quantifiers
+        quantifier_pairs = [
+            ('all', 'some'), ('some', 'none'), ('every', 'few'), 
+            ('many', 'few'), ('most', 'least'), ('always', 'never'),
+            ('never', 'always'), ('everyone', 'no one'), ('everything', 'nothing')
+        ]
+        
+        # Try to find and replace existing quantifiers
+        replaced = False
+        for i, word in enumerate(words):
+            for q1, q2 in quantifier_pairs:
+                if word.lower() == q1:
+                    words[i] = q2
+                    replaced = True
+                    break
+            if replaced:
+                break
+        
+        # If no quantifier found, add one at the beginning
+        if not replaced:
+            words.insert(0, random.choice(['some', 'few', 'rarely', 'hardly']))
+    
+    elif strategy == 'modal':
+        # Add or change modal verbs
+        modal_pairs = [
+            ('can', 'cannot'), ('must', 'need not'), ('should', 'should not'),
+            ('will', 'will not'), ('may', 'may not'), ('could', 'could not')
+        ]
+        
+        # Try to find and replace existing modals
+        replaced = False
+        for i, word in enumerate(words):
+            for m1, m2 in modal_pairs:
+                if word.lower() == m1:
+                    words[i] = m2
+                    replaced = True
+                    break
+            if replaced:
+                break
+        
+        # If no modal found, add one at the beginning
+        if not replaced:
+            words.insert(0, random.choice(['cannot', 'should not', 'must not', 'will not']))
+    
+    return ' '.join(words)
+
+def restructure_with_preserved_words(sentence):
+    """Change the structure while preserving some key words."""
+    words = sentence.split()
+    
+    if len(words) < 4:
+        return "not " + sentence
+    
+    # Extract some key words (longer words are likely more important)
+    key_words = [word for word in words if len(word) > 4]
+    if not key_words:
+        key_words = words
+    
+    # Select a subset of key words to preserve
+    num_to_preserve = min(len(key_words), random.randint(2, 3))
+    preserved_words = random.sample(key_words, num_to_preserve)
+    
+    # Create new structures with the preserved words
+    structures = [
+        f"Unlike {preserved_words[0]}, {' '.join(preserved_words[1:])} is completely different.",
+        f"While {preserved_words[0]} might suggest {' '.join(preserved_words[1:])}, they are unrelated.",
+        f"The concept of {preserved_words[0]} has nothing to do with {' '.join(preserved_words[1:])}.",
+        f"Contrary to {preserved_words[0]}, {' '.join(preserved_words[1:])} means something else entirely.",
+        f"Although {preserved_words[0]} sounds similar to {' '.join(preserved_words[1:])}, they differ in meaning."
+    ]
+    
+    return random.choice(structures)
+
+def make_superficial_changes(sentence):
+    """Make superficial changes that don't significantly alter meaning."""
+    words = sentence.split()
+    
     if len(words) < 3:
         return sentence
     
-    # Skip very short words and common stop words
-    content_word_indices = [i for i, word in enumerate(words) 
-                           if len(word) > 3 and word.lower() not in ['this', 'that', 'with', 'from']]
+    # Strategies:
+    # 1. Reorder words slightly
+    # 2. Add filler words
+    # 3. Change word forms (singular/plural, tense)
     
-    if not content_word_indices:
-        return sentence
+    strategy = random.choice(['reorder', 'filler', 'form'])
     
-    idx_to_replace = random.choice(content_word_indices)
+    if strategy == 'reorder' and len(words) > 4:
+        # Swap two adjacent words that aren't at the beginning
+        idx = random.randint(1, len(words) - 2)
+        words[idx], words[idx+1] = words[idx+1], words[idx]
     
-    # List of replacement words that could change meaning
-    replacements = ['different', 'opposite', 'unrelated', 'similar', 'alternative', 
-                   'wrong', 'correct', 'better', 'worse', 'never', 'always']
+    elif strategy == 'filler':
+        # Add filler words that don't change meaning
+        fillers = ['basically', 'essentially', 'fundamentally', 'generally', 
+                  'actually', 'practically', 'virtually', 'technically']
+        
+        # Insert at a random position
+        pos = random.randint(0, len(words))
+        words.insert(pos, random.choice(fillers))
     
-    words[idx_to_replace] = random.choice(replacements)
+    elif strategy == 'form':
+        # Try to change word forms
+        # This is a simplified approach - in a real system you'd use NLP tools
+        for i, word in enumerate(words):
+            if len(word) > 3 and word.endswith('s') and not word.endswith('ss'):
+                # Remove potential plural 's'
+                words[i] = word[:-1]
+                break
+            elif len(word) > 3 and not word.endswith('s') and not word.endswith('sh') and not word.endswith('ch'):
+                # Add potential plural 's'
+                words[i] = word + 's'
+                break
+    
     return ' '.join(words)
 
-def replace_multiple_words(sentence):
-    """Replace multiple words in the sentence."""
-    modified = replace_random_word(sentence)
-    return replace_random_word(modified)
-
-def add_qualifier(sentence):
-    """Add a qualifier to the sentence."""
-    qualifiers = ['sometimes', 'often', 'rarely', 'possibly', 'maybe', 
-                 'occasionally', 'frequently', 'seldom', 'never', 'always']
-    
-    qualifier = random.choice(qualifiers)
+def create_similar_but_different(sentence):
+    """Create a sentence with similar words but different meaning."""
     words = sentence.split()
     
-    # Insert at beginning, middle, or end
-    position = random.choice(['beginning', 'middle', 'end'])
+    if len(words) < 3:
+        return "not " + sentence
     
-    if position == 'beginning':
-        return qualifier + ' ' + sentence
-    elif position == 'middle' and len(words) > 2:
-        mid_point = len(words) // 2
-        words.insert(mid_point, qualifier)
-        return ' '.join(words)
-    else:
-        return sentence + ' ' + qualifier
-
-def remove_qualifier(sentence):
-    """Remove a qualifier if present."""
-    qualifiers = ['sometimes', 'often', 'rarely', 'possibly', 'maybe', 
-                 'occasionally', 'frequently', 'seldom', 'never', 'always']
+    # Extract some key words
+    key_words = [word for word in words if len(word) > 3]
+    if not key_words:
+        key_words = words
     
-    words = sentence.split()
-    filtered_words = [word for word in words if word.lower() not in qualifiers]
+    # Select a subset of key words to use
+    num_to_use = min(len(key_words), random.randint(2, 3))
+    selected_words = random.sample(key_words, num_to_use)
     
-    if len(filtered_words) < len(words):
-        return ' '.join(filtered_words)
-    else:
-        # If no qualifier found, just return the original sentence
-        return sentence
-
-def restructure_sentence(sentence):
-    """Change the structure of the sentence."""
-    # Simple restructuring: add a prefix phrase
-    prefixes = [
-        "Contrary to popular belief, ",
-        "Unlike what most people think, ",
-        "In a different context, ",
-        "From another perspective, ",
-        "As an alternative view, "
+    # Create new sentence with different meaning but similar words
+    templates = [
+        f"Is {selected_words[0]} related to {' '.join(selected_words[1:])}?",
+        f"The difference between {selected_words[0]} and {' '.join(selected_words[1:])} is significant.",
+        f"{selected_words[0]} cannot be compared with {' '.join(selected_words[1:])}.",
+        f"While {selected_words[0]} exists, {' '.join(selected_words[1:])} is a separate concept.",
+        f"How does {selected_words[0]} differ from {' '.join(selected_words[1:])}?"
     ]
     
-    return random.choice(prefixes) + sentence
+    return random.choice(templates)
+
+def preserve_structure_change_meaning(sentence):
+    """Preserve sentence structure but change key content words to alter meaning."""
+    words = sentence.split()
+    
+    if len(words) < 4:
+        return "not " + sentence
+    
+    # Identify content words (nouns, verbs, adjectives)
+    # Simple heuristic: longer words are more likely to be content words
+    content_word_indices = [i for i, word in enumerate(words) 
+                           if len(word) > 3 and word.lower() not in ['this', 'that', 'with', 'from', 'have', 'what', 'when', 'where', 'which']]
+    
+    if len(content_word_indices) < 2:
+        return "not " + sentence
+    
+    # Replace most content words while keeping structure
+    num_to_replace = max(2, len(content_word_indices) - 1)  # Replace all but one content word
+    indices_to_replace = random.sample(content_word_indices, num_to_replace)
+    
+    # Domain-specific replacements to ensure meaning change
+    replacements = [
+        'computer', 'software', 'hardware', 'program', 'algorithm',
+        'database', 'network', 'server', 'website', 'application',
+        'interface', 'system', 'platform', 'framework', 'protocol',
+        'language', 'code', 'function', 'variable', 'object',
+        'method', 'class', 'library', 'module', 'package'
+    ]
+    
+    for idx in indices_to_replace:
+        words[idx] = random.choice(replacements)
+    
+    return ' '.join(words)
+
+def create_deceptive_paraphrase(sentence):
+    """Create a sentence that looks like a paraphrase but has a subtle meaning change."""
+    words = sentence.split()
+    
+    if len(words) < 4:
+        return sentence + " but not really"
+    
+    # Strategies:
+    # 1. Change a single critical word that alters meaning
+    # 2. Add a subtle qualifier that changes meaning
+    # 3. Restructure to create a subtle meaning shift
+    
+    strategy = random.choice(['critical_word', 'qualifier', 'restructure'])
+    
+    if strategy == 'critical_word':
+        # Find a critical word to change
+        content_word_indices = [i for i, word in enumerate(words) 
+                               if len(word) > 3 and word.lower() not in ['this', 'that', 'with', 'from']]
+        
+        if content_word_indices:
+            idx = random.choice(content_word_indices)
+            # Replace with a word that looks similar but changes meaning
+            similar_but_different = {
+                'increase': 'decrease', 'decrease': 'increase',
+                'include': 'exclude', 'exclude': 'include',
+                'internal': 'external', 'external': 'internal',
+                'maximum': 'minimum', 'minimum': 'maximum',
+                'major': 'minor', 'minor': 'major',
+                'positive': 'negative', 'negative': 'positive',
+                'add': 'subtract', 'subtract': 'add',
+                'before': 'after', 'after': 'before',
+                'cause': 'effect', 'effect': 'cause',
+                'create': 'destroy', 'destroy': 'create'
+            }
+            
+            word = words[idx].lower()
+            if word in similar_but_different:
+                words[idx] = similar_but_different[word]
+            else:
+                # If no direct opposite, use a subtle replacement
+                subtle_replacements = ['slightly', 'somewhat', 'partially', 'occasionally']
+                words.insert(idx, random.choice(subtle_replacements))
+    
+    elif strategy == 'qualifier':
+        # Add a subtle qualifier that changes meaning
+        qualifiers = ['rarely', 'hardly', 'barely', 'seldom', 'occasionally', 
+                     'supposedly', 'allegedly', 'seemingly', 'apparently']
+        
+        # Insert at a position that makes it look like a paraphrase
+        pos = random.randint(0, min(3, len(words)))
+        words.insert(pos, random.choice(qualifiers))
+    
+    elif strategy == 'restructure':
+        # Restructure to create a subtle meaning shift
+        if random.random() < 0.5:
+            # Add a contradicting clause at the end
+            contradiction = random.choice([
+                "but not always", "though not in all cases", 
+                "except in rare circumstances", "but with important differences",
+                "although exceptions exist", "but only in theory"
+            ])
+            words.append(contradiction)
+        else:
+            # Change to a question form that subtly alters meaning
+            question_prefix = random.choice([
+                "Is it true that", "Could it be that", 
+                "Do we know if", "Should we assume that"
+            ])
+            words = question_prefix.split() + words
+    
+    return ' '.join(words)
