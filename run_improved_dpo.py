@@ -1,9 +1,6 @@
 '''
 Run improved Direct Preference Optimization (DPO) training for paraphrase detection.
 
-This script uses the modified paraphrase_detection.py with improved DPO implementation
-to train a model that should achieve better performance than standard training.
-It maintains compatibility with the original code and autograder.
 
 Usage:
   python run_improved_dpo.py --use_gpu

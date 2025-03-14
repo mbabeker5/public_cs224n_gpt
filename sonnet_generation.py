@@ -67,8 +67,8 @@ class SonnetGPT(nn.Module):
     # Extract the last hidden state - this contains hidden states for all tokens in the sequence
     hidden_states = output['last_hidden_state']
     
-    # For language modeling, we need to predict the next token for each position
-    # We use the GPT2's vocabulary size for the output dimension
+    # Predict the next token for each position
+    # Use the GPT2's vocabulary size for the output dimension
     batch_size, seq_length, hidden_dim = hidden_states.shape
     
     # Project the hidden states to the vocabulary size using the GPT2's word embedding matrix
@@ -105,12 +105,12 @@ class SonnetGPT(nn.Module):
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
 
-      # Top-p (nucleus) sampling
+      # Top-p sampling
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
       cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
       top_p_mask = cumulative_probs <= top_p
       top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding        
-      top_p_mask[..., 0] = True  # Always include the highest probability token
+      top_p_mask[..., 0] = True  # Include the highest probability token
       filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
       filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
 

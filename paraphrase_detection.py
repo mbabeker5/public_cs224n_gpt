@@ -38,7 +38,7 @@ from optimizer import AdamW
 
 TQDM_DISABLE = False
 
-# Fix the random seed.
+
 def seed_everything(seed=11711):
   random.seed(seed)
   np.random.seed(seed)
@@ -57,7 +57,7 @@ class ParaphraseGPT(nn.Module):
     self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
     
     # By default, fine-tune the full model.
-    # Instead of a 2-class output, we'll directly predict the token IDs for "yes" (8505) and "no" (3919)
+    # Instead of a 2-class output, directly predict the token IDs for "yes" (8505) and "no" (3919)
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     
     # Map class indices to token IDs
@@ -79,7 +79,7 @@ class ParaphraseGPT(nn.Module):
         nn.Linear(self.hidden_size, 2)
     )
     
-    # We'll freeze most of the model by default to speed up training
+    # Freeze most of the model by default to speed up training
     self.freeze_most_layers(args.num_trainable_layers)
 
   def freeze_most_layers(self, num_trainable_layers):
@@ -451,7 +451,7 @@ def train(args):
         loss = dpo_loss(model, winning_batch, losing_batch, beta=args.dpo_beta, device=device, alpha=alpha)
       else:
         # Standard training
-        # Get the input and move it to the gpu (I do not recommend training this model on CPU).
+        # Get the input and move it to the gpu 
         b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
         b_ids = b_ids.to(device)
         b_mask = b_mask.to(device)

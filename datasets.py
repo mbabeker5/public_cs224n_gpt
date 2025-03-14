@@ -268,7 +268,6 @@ def generate_losing_samples(model, tokenizer, train_data, device, strategy="heur
                 losing_samples[sent_id] = (modified_sent, sent2, 0, f"{sent_id}_losing")
             else:  # Non-paraphrase
                 # For non-paraphrases, create a paraphrase-like example that's actually not a paraphrase
-                # This is more challenging than just swapping the label
                 if random.random() < 0.5:
                     # Strategy 1: Make superficial changes that don't change meaning enough
                     modified_sent = make_superficial_changes(sent1)
